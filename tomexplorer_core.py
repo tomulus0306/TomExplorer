@@ -234,6 +234,10 @@ class WindowGasMetric:
     interference_alpha_per_cm: float
     signal_to_interference: float
     prominence_ratio: float
+    peak_region_target_contrast_per_cm: float = 0.0
+    peak_region_interference_contrast_per_cm: float = 0.0
+    peak_region_selectivity: float = 0.0
+    peak_region_purity: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -981,22 +985,50 @@ def _evaluate_window_candidate(
     seed_gas: str,
     seed_index: int,
 ) -> LaserWindowCandidate | None:
+    def peak_region_bounds(profile: np.ndarray, peak_index: int) -> tuple[int, int]:
+        peak_value = float(profile[peak_index])
+        if peak_value <= 0:
+            return peak_index, peak_index
+        threshold = peak_value * 0.55
+        left = peak_index
+        right = peak_index
+        while left > 0 and float(profile[left - 1]) >= threshold:
+            left -= 1
+        while right + 1 < profile.size and float(profile[right + 1]) >= threshold:
+            right += 1
+        left = min(left, max(0, peak_index - 2))
+        right = max(right, min(profile.size - 1, peak_index + 2))
+        return left, right
+
+    def peak_flank_baseline(profile: np.ndarray, left: int, right: int) -> float:
+        flank_levels: list[float] = []
+        left_slice = profile[max(0, left - 3):left]
+        right_slice = profile[right + 1:min(profile.size, right + 4)]
+        if left_slice.size:
+            flank_levels.append(float(np.mean(left_slice)))
+        if right_slice.size:
+            flank_levels.append(float(np.mean(right_slice)))
+        if flank_levels:
+            return float(sum(flank_levels) / len(flank_levels))
+        return float(np.min(profile))
+
     mask = (result.wavelength_um >= wavelength_min_um) & (result.wavelength_um <= wavelength_max_um)
     if int(np.sum(mask)) < 8:
         return None
 
-    total_interference = np.zeros(int(np.sum(mask)), dtype=float)
+    total_absorption = np.zeros(int(np.sum(mask)), dtype=float)
     for gas in target_gases:
-        total_interference += result.components[gas].alpha_per_cm[mask]
+        total_absorption += result.components[gas].alpha_per_cm[mask]
     for gas in interference_gases:
         if gas in result.components:
-            total_interference += result.components[gas].alpha_per_cm[mask]
+            total_absorption += result.components[gas].alpha_per_cm[mask]
 
     coverage: list[str] = []
     gas_metrics: dict[str, WindowGasMetric] = {}
     score = 0.0
     center_wl = float(result.wavelength_um[seed_index])
-    window_signal_to_interference_values: list[float] = []
+    peak_region_selectivity_values: list[float] = []
+    peak_region_purity_values: list[float] = []
 
     for gas in target_gases:
         component = result.components[gas]
@@ -1014,21 +1046,36 @@ def _evaluate_window_candidate(
         peak_wl = float(local_wavelengths[local_peak_idx])
         peak_nu = float(local_wavenumbers[local_peak_idx])
 
-        other_profile = total_interference - alpha_window
+        other_profile = total_absorption - alpha_window
         other_alpha = float(other_profile[local_peak_idx])
         signal_to_interference = peak_alpha / (other_alpha + 1.0e-30)
-        window_other_peak = float(np.max(other_profile))
-        window_signal_to_interference = peak_alpha / (window_other_peak + 1.0e-30)
+        region_left, region_right = peak_region_bounds(alpha_window, local_peak_idx)
+        target_baseline = peak_flank_baseline(alpha_window, region_left, region_right)
+        other_baseline = peak_flank_baseline(other_profile, region_left, region_right)
+        total_baseline = peak_flank_baseline(total_absorption, region_left, region_right)
+        target_peak_contrast = max(0.0, peak_alpha - target_baseline)
+        other_peak_contrast = max(
+            0.0,
+            float(np.max(other_profile[region_left:region_right + 1])) - other_baseline,
+        )
+        total_peak_contrast = max(
+            0.0,
+            float(np.max(total_absorption[region_left:region_right + 1])) - total_baseline,
+        )
+        peak_region_selectivity = target_peak_contrast / (other_peak_contrast + 1.0e-30)
+        peak_region_purity = target_peak_contrast / (total_peak_contrast + 1.0e-30)
         gas_peak = float(np.max(component.alpha_per_cm))
         prominence_ratio = peak_alpha / (gas_peak + 1.0e-30)
         if prominence_ratio < 0.12:
             continue
 
         coverage.append(gas)
-        window_signal_to_interference_values.append(window_signal_to_interference)
+        peak_region_selectivity_values.append(peak_region_selectivity)
+        peak_region_purity_values.append(peak_region_purity)
         score += (prominence_ratio * 42.0)
-        score += min(signal_to_interference, 25.0) * 8.0
-        score += min(window_signal_to_interference, 25.0) * 12.0
+        score += min(signal_to_interference, 25.0) * 6.0
+        score += min(peak_region_selectivity, 25.0) * 14.0
+        score += min(max(0.0, peak_region_purity), 1.0) * 95.0
         gas_metrics[gas] = WindowGasMetric(
             gas=gas,
             peak_alpha_per_cm=peak_alpha,
@@ -1039,6 +1086,10 @@ def _evaluate_window_candidate(
             interference_alpha_per_cm=float(other_alpha),
             signal_to_interference=float(signal_to_interference),
             prominence_ratio=float(prominence_ratio),
+            peak_region_target_contrast_per_cm=float(target_peak_contrast),
+            peak_region_interference_contrast_per_cm=float(other_peak_contrast),
+            peak_region_selectivity=float(peak_region_selectivity),
+            peak_region_purity=float(peak_region_purity),
         )
 
     if seed_gas not in gas_metrics:
@@ -1053,8 +1104,10 @@ def _evaluate_window_candidate(
     mean_signal_to_interference = sum(
         metric.signal_to_interference for metric in gas_metrics.values()
     ) / len(gas_metrics)
-    worst_window_signal_to_interference = min(window_signal_to_interference_values)
-    mean_window_signal_to_interference = sum(window_signal_to_interference_values) / len(window_signal_to_interference_values)
+    worst_peak_region_selectivity = min(peak_region_selectivity_values)
+    mean_peak_region_selectivity = sum(peak_region_selectivity_values) / len(peak_region_selectivity_values)
+    worst_peak_region_purity = min(peak_region_purity_values)
+    mean_peak_region_purity = sum(peak_region_purity_values) / len(peak_region_purity_values)
 
     required_min_um = min(metric.peak_wavelength_um for metric in gas_metrics.values())
     required_max_um = max(metric.peak_wavelength_um for metric in gas_metrics.values())
@@ -1065,8 +1118,10 @@ def _evaluate_window_candidate(
     score += 12.0 * len(coverage)
     score -= max(0.0, 3.0 - worst_signal_to_interference) * 95.0
     score -= max(0.0, 5.0 - mean_signal_to_interference) * 30.0
-    score -= max(0.0, 3.5 - worst_window_signal_to_interference) * 170.0
-    score -= max(0.0, 6.0 - mean_window_signal_to_interference) * 48.0
+    score -= max(0.0, 2.0 - worst_peak_region_selectivity) * 180.0
+    score -= max(0.0, 4.0 - mean_peak_region_selectivity) * 52.0
+    score -= max(0.0, 0.72 - worst_peak_region_purity) * 260.0
+    score -= max(0.0, 0.82 - mean_peak_region_purity) * 110.0
     score -= required_span_nm * 12.0
     score -= max(0.0, required_span_nm - 2.0) * 6.0
 
