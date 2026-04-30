@@ -43,6 +43,9 @@ LOGO_ASSET_PATH = "/assets/tomexplorer-logo.svg"
 BODY_FONT = "Aptos, 'Segoe UI Variable', 'Segoe UI', sans-serif"
 DISPLAY_FONT = "Constantia, 'Palatino Linotype', Georgia, serif"
 HITRAN_RUNTIME_LABEL = f"HAPI {getattr(hp, 'HAPI_VERSION', 'unbekannt')}"
+SEARCH_PLOT_FINE_STEP_CM1 = 0.001
+SEARCH_PLOT_FINE_MAX_POINTS = 15000
+SEARCH_PLOT_PADDING_UM = 0.00075
 UNIT_OPTIONS = [
     {"label": "ppb", "value": "ppb"},
     {"label": "ppm", "value": "ppm"},
@@ -753,6 +756,51 @@ def build_search_store(
         "interference_concentrations": interference_concentrations,
         "range_unit": range_unit,
     }
+
+
+def rebuild_selected_search_result(
+    store: dict[str, Any],
+    plan: LaserPlan,
+) -> tuple[Any, float]:
+    coarse_result = deserialize_manual_result(store["spectrum"])
+    if not plan.windows:
+        return coarse_result, coarse_result.step_cm1
+
+    merged_concentrations = {
+        **store.get("interference_concentrations", {}),
+        **store.get("target_concentrations", {}),
+    }
+    if not merged_concentrations:
+        return coarse_result, coarse_result.step_cm1
+
+    window_min_um = min(window.wavelength_min_um for window in plan.windows)
+    window_max_um = max(window.wavelength_max_um for window in plan.windows)
+    padding_um = max((window_max_um - window_min_um) * 0.08, SEARCH_PLOT_PADDING_UM)
+    local_min_um = max(float(np.min(coarse_result.wavelength_um)), window_min_um - padding_um)
+    local_max_um = min(float(np.max(coarse_result.wavelength_um)), window_max_um + padding_um)
+    if local_max_um <= local_min_um:
+        return coarse_result, coarse_result.step_cm1
+
+    local_nu_min, local_nu_max = normalize_wavenumber_window("um", local_min_um, local_max_um)
+    local_span_cm1 = abs(local_nu_max - local_nu_min)
+    fine_step_cm1 = max(
+        min(coarse_result.step_cm1, SEARCH_PLOT_FINE_STEP_CM1),
+        local_span_cm1 / SEARCH_PLOT_FINE_MAX_POINTS,
+    )
+
+    try:
+        fine_result = build_manual_spectrum(
+            concentrations=merged_concentrations,
+            temperature_c=coarse_result.temperature_c,
+            pressure_hpa=coarse_result.pressure_hpa,
+            range_unit="um",
+            range_min=local_min_um,
+            range_max=local_max_um,
+            step_cm1=fine_step_cm1,
+        )
+    except Exception:
+        return coarse_result, coarse_result.step_cm1
+    return fine_result, fine_step_cm1
 
 
 app.layout = html.Div(
@@ -1519,7 +1567,7 @@ def update_search_plot(selected_rows: list[int], range_unit: str, store: dict[st
     if row_index >= len(store["plans"]):
         row_index = 0
     plan = deserialize_laser_plan(store["plans"][row_index])
-    result = deserialize_manual_result(store["spectrum"])
+    result, fine_step_cm1 = rebuild_selected_search_result(store, plan)
     x_unit = range_unit
     highlighted_windows = [
         {
@@ -1550,11 +1598,11 @@ def update_search_plot(selected_rows: list[int], range_unit: str, store: dict[st
         center_value = (zoom_min + zoom_max) / 2.0
         center_wavelength_um = float(wavenumber_cm1_to_wavelength_um(center_value))
         min_padding = abs(
-            float(wavelength_um_to_wavenumber_cm1(center_wavelength_um - 0.00075))
-            - float(wavelength_um_to_wavenumber_cm1(center_wavelength_um + 0.00075))
+            float(wavelength_um_to_wavenumber_cm1(center_wavelength_um - SEARCH_PLOT_PADDING_UM))
+            - float(wavelength_um_to_wavenumber_cm1(center_wavelength_um + SEARCH_PLOT_PADDING_UM))
         ) / 2.0
     else:
-        min_padding = 0.00075
+        min_padding = SEARCH_PLOT_PADDING_UM
     zoom_padding = max((zoom_max - zoom_min) * 0.08, min_padding)
     x_range = [
         max(float(np.min(x_values)), zoom_min - zoom_padding),
@@ -1591,6 +1639,7 @@ def update_search_plot(selected_rows: list[int], range_unit: str, store: dict[st
         revision_key=plan_revision_key,
         preserve_ui_state=False,
     )
+    figure.update_layout(meta={**(figure.layout.meta or {}), "step_cm1": fine_step_cm1})
 
     annotation_lines: list[str] = []
     for window in plan.windows:
