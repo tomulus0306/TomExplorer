@@ -1,0 +1,38 @@
+========================================
+NOTEBOOK EDITING METHOD
+========================================
+
+For reliable editing of Spektren.ipynb:
+
+❌ DO NOT USE:
+- edit_notebook_file tool (unreliable)
+- replace_string_in_file on .ipynb (encoding issues)
+- Hilfsdatei helper scripts (creates clutter)
+
+✅ USE THIS METHOD:
+1. Load notebook as JSON with UTF-8 encoding
+2. Find cell by index (not ID - IDs change)
+3. Modify cell['source'] 
+4. Write back with UTF-8 encoding
+5. Done - no helper files needed
+
+Example Python script:
+```python
+import json
+nb = json.load(open('Spektren.ipynb', encoding='utf-8'))
+cell = nb['cells'][index]
+# modify cell['source']
+with open('Spektren.ipynb', 'w', encoding='utf-8') as f:
+    json.dump(nb, f, indent=1, ensure_ascii=False)
+```
+
+KEY DETAILS:
+- Always use encoding='utf-8' (not system default)
+- Use cell index, not ID lookup
+- Cells are at indices 0-22 (total 23 cells)
+- Delete any helper scripts immediately after use
+
+This method works reliably and is the ONLY way
+that consistently works with this notebook file.
+
+========================================

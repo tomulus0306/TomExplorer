@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+hitran_cache/
+abscross_dict.pkl
+
+__tmp_root.html
+
+.ipynb_checkpoints/
+
+.vscode/

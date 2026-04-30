@@ -1,0 +1,60 @@
+<svg width="720" height="720" viewBox="0 0 720 720" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="shadow" x="0" y="0" width="720" height="720" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#0F2746" flood-opacity="0.12"/>
+    </filter>
+    <radialGradient id="pageGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(360 360) rotate(90) scale(330 330)">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F5F3EE"/>
+    </radialGradient>
+    <radialGradient id="blueMetal" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(0.35 0.2) rotate(52) scale(1.2)">
+      <stop stop-color="#BFD3EE"/>
+      <stop offset="0.35" stop-color="#6D8EBB"/>
+      <stop offset="0.72" stop-color="#294A7A"/>
+      <stop offset="1" stop-color="#0E2346"/>
+    </radialGradient>
+    <linearGradient id="specLine" x1="242" y1="280" x2="536" y2="280" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#315CC6"/>
+      <stop offset="0.5" stop-color="#7A3C9A"/>
+      <stop offset="1" stop-color="#D32622"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="720" height="720" fill="url(#pageGlow)"/>
+
+  <g filter="url(#shadow)">
+    <path d="M188 180C225 131 286 98 355 98C445 98 525 154 565 242" stroke="#0C234D" stroke-width="12" stroke-linecap="round"/>
+    <path d="M545 414C503 503 413 565 309 565C247 565 189 543 143 506" stroke="#0C234D" stroke-width="12" stroke-linecap="round"/>
+
+    <g stroke="#D9E1EC" stroke-width="6" stroke-linecap="round">
+      <path d="M196 334L255 294"/>
+      <path d="M255 294L288 227"/>
+      <path d="M255 294L204 366"/>
+      <path d="M288 227L349 227"/>
+      <path d="M288 227L268 184"/>
+    </g>
+
+    <g fill="url(#blueMetal)">
+      <circle cx="255" cy="294" r="24"/>
+      <circle cx="196" cy="334" r="16"/>
+      <circle cx="204" cy="366" r="14"/>
+      <circle cx="288" cy="227" r="16"/>
+      <circle cx="349" cy="227" r="12"/>
+      <circle cx="268" cy="184" r="12"/>
+    </g>
+
+    <path d="M250 385H532" stroke="url(#specLine)" stroke-width="3"/>
+    <path d="M260 384C263 384 264 383 265 340C266 383 267 384 270 384C273 384 274 383 275 316C276 383 277 384 280 384C284 384 286 384 287 362C288 384 289 384 292 384C298 384 300 383 301 300C302 383 303 384 307 384C314 384 317 382 318 228C319 381 320 384 325 384C333 384 335 382 336 310C337 382 339 384 343 384C351 384 353 380 355 156C357 380 359 384 365 384C374 384 377 376 381 206C384 376 386 384 392 384C399 384 402 376 407 246C411 377 413 384 420 384C428 384 431 379 434 284C436 379 438 384 444 384C452 384 454 378 457 304C459 378 461 384 467 384C474 384 476 380 479 326C481 380 483 384 489 384C495 384 497 382 500 346C502 382 504 384 510 384C516 384 518 383 520 364C522 383 524 384 528 384" stroke="url(#specLine)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <text x="104" y="604" fill="#0C234D" font-family="Aptos, Segoe UI, sans-serif" font-size="114" letter-spacing="14">HITR</text>
+    <g transform="translate(455 527)">
+      <path d="M0 75C11 75 14 34 22 34C30 34 34 8 42 8C50 8 54 38 62 38C70 38 74 22 82 22C90 22 95 55 108 76" stroke="url(#specLine)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M2 76H104" stroke="#0C234D" stroke-opacity="0.26" stroke-width="2"/>
+    </g>
+    <text x="570" y="604" fill="#0C234D" font-family="Aptos, Segoe UI, sans-serif" font-size="114" letter-spacing="14">N</text>
+    <text x="109" y="650" fill="#315C8F" font-family="Aptos, Segoe UI, sans-serif" font-size="34" letter-spacing="9">SPECTRA SIMULATOR</text>
+    <path d="M140 684H236" stroke="#315C8F" stroke-width="1.5" stroke-linecap="round"/>
+    <path d="M482 684H590" stroke="#315C8F" stroke-width="1.5" stroke-linecap="round"/>
+    <text x="250" y="696" fill="#0C234D" font-family="Aptos, Segoe UI, sans-serif" font-size="26" letter-spacing="2">TomExplorer</text>
+  </g>
+</svg>
