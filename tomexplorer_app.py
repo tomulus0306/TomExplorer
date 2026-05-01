@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import os
 from pathlib import Path
 import threading
@@ -16,8 +17,13 @@ from dash.exceptions import PreventUpdate
 import plotly.graph_objects as go
 
 from tomexplorer_core import (
+    DEFAULT_MANUAL_STEP_CM1,
     GAS_LIBRARY,
     LaserPlan,
+    LIVE_DB_MODE,
+    OFFLINE_DB_MODE,
+    PICKLE_REBUILD_PRESSURE_HPA,
+    PICKLE_REBUILD_TEMPERATURE_C,
     build_manual_spectrum,
     concentration_to_molar_fraction,
     deserialize_laser_plan,
@@ -27,6 +33,7 @@ from tomexplorer_core import (
     gas_options,
     hover_payload,
     normalize_wavenumber_window,
+    offline_library_summary,
     recommended_step_cm1,
     refresh_hitran_database,
     serialize_laser_plan,
@@ -71,6 +78,8 @@ DEFAULT_INTERFERENCE_CONCENTRATIONS = {
 }
 ALL_GASES = sorted(GAS_LIBRARY.keys())
 CACHE_STALENESS_DAYS = 30
+BUTTON_LOCK_HIDDEN = {"display": "none"}
+BUTTON_LOCK_VISIBLE = {"display": "flex"}
 
 MANUAL_CONCENTRATION_STATES = [
     State(f"manual-concentration-value-{gas}", "value") for gas in ALL_GASES
@@ -158,6 +167,102 @@ def startup_hitran_message() -> str | None:
             "Es koennte neuere HITRAN-Daten geben. Soll der lokale Cache jetzt aktualisiert werden?"
         )
     return None
+
+
+def offline_mode_enabled(selection: list[str] | None) -> bool:
+    return OFFLINE_DB_MODE in (selection or [])
+
+
+def format_file_size(size_bytes: int | float) -> str:
+    size = float(size_bytes)
+    units = ("B", "KB", "MB", "GB", "TB")
+    unit_index = 0
+    while size >= 1024.0 and unit_index < len(units) - 1:
+        size /= 1024.0
+        unit_index += 1
+    precision = 0 if unit_index == 0 else 1 if size >= 10 else 2
+    return f"{size:.{precision}f} {units[unit_index]}"
+
+
+def offline_db_state() -> tuple[bool, str, str]:
+    try:
+        summary = offline_library_summary()
+    except Exception:
+        return False, "(Offline-DB nicht vorhanden)", LIVE_DB_MODE
+
+    updated_at_raw = summary.get("updated_at")
+    try:
+        updated_at = datetime.fromisoformat(str(updated_at_raw)).strftime("%d.%m.%Y") if updated_at_raw else "unbekannt"
+    except ValueError:
+        updated_at = str(updated_at_raw)
+
+    step_cm1 = float(summary.get("native_step_cm1", DEFAULT_MANUAL_STEP_CM1))
+    temperature_c = float(summary.get("reference_temperature_c", PICKLE_REBUILD_TEMPERATURE_C))
+    pressure_hpa = float(summary.get("reference_pressure_hpa", PICKLE_REBUILD_PRESSURE_HPA))
+    pkl_size = format_file_size(Path(str(summary.get("path", ""))).stat().st_size)
+    meta = (
+        f"(Stand {updated_at} | {temperature_c:.1f} °C | {pressure_hpa:.2f} hPa | {step_cm1:.3f} cm⁻¹ | {pkl_size})"
+    )
+    return True, meta, OFFLINE_DB_MODE
+
+
+def offline_coverage_label(range_unit: str) -> str | None:
+    try:
+        summary = offline_library_summary()
+    except Exception:
+        return None
+
+    coverage_min_cm1 = float(summary.get("coverage_min_cm1", 0.0))
+    coverage_max_cm1 = float(summary.get("coverage_max_cm1", 0.0))
+    if range_unit == "um":
+        coverage_min, coverage_max = normalize_wavelength_window("cm-1", coverage_min_cm1, coverage_max_cm1)
+        return f"{coverage_min:.3f}-{coverage_max:.3f} µm"
+    return f"{coverage_min_cm1:.2f}-{coverage_max_cm1:.2f} cm⁻¹"
+
+
+def format_data_source_error(
+    exc: Exception,
+    data_source: str,
+    range_unit: str,
+    range_min: float | None,
+    range_max: float | None,
+) -> str:
+    message = str(exc)
+    if data_source != OFFLINE_DB_MODE:
+        return message
+
+    if "Offline spectra file not found" in message:
+        return (
+            "Die schnelle Offline-DB ist noch nicht aufgebaut. Im Offline-Modus wird nicht automatisch live nachgeladen. "
+            "Bitte zuerst den lokalen HITRAN-Cache aktualisieren oder den Offline-Modus ausschalten."
+        )
+
+    if "Offline spectra are missing for:" in message:
+        missing = message.split("Offline spectra are missing for:", 1)[1].split(".", 1)[0].strip()
+        return (
+            f"Die schnelle Offline-DB enthaelt noch keine vorgerechneten Spektren fuer: {missing}. "
+            "Im Offline-Modus wird nicht automatisch live nachgeladen. Bitte den lokalen HITRAN-Cache fuer diese Komponenten aktualisieren oder den Offline-Modus ausschalten."
+        )
+
+    if "Requested range is outside offline pickle coverage" in message:
+        requested_text = None
+        if range_min is not None and range_max is not None:
+            requested_min = float(min(range_min, range_max))
+            requested_max = float(max(range_min, range_max))
+            if range_unit == "um":
+                requested_text = f"{requested_min:.3f}-{requested_max:.3f} µm"
+            else:
+                requested_text = f"{requested_min:.2f}-{requested_max:.2f} cm⁻¹"
+        coverage_text = offline_coverage_label(range_unit)
+        requested_clause = f"Der gewaehlte Bereich {requested_text} " if requested_text else "Der gewaehlte Bereich "
+        coverage_clause = f"liegt ausserhalb der schnellen Offline-DB ({coverage_text}). " if coverage_text else "liegt ausserhalb der schnellen Offline-DB. "
+        return (
+            requested_clause
+            + coverage_clause
+            + "Im Offline-Modus wird nicht automatisch live nachgeladen. Bitte Bereich anpassen, den lokalen HITRAN-Cache fuer diesen Bereich aktualisieren oder den Offline-Modus ausschalten."
+        )
+
+    return message
 
 
 def parameter_field(label: Any, component: Any) -> html.Div:
@@ -748,6 +853,7 @@ def build_search_store(
     target_concentrations: dict[str, float],
     interference_concentrations: dict[str, float],
     range_unit: str,
+    data_source: str,
 ) -> dict[str, Any]:
     return {
         "plans": [serialize_laser_plan(plan) for plan in plans],
@@ -755,6 +861,7 @@ def build_search_store(
         "target_concentrations": target_concentrations,
         "interference_concentrations": interference_concentrations,
         "range_unit": range_unit,
+        "data_source": data_source,
     }
 
 
@@ -789,6 +896,7 @@ def rebuild_selected_search_result(
     )
 
     try:
+        data_source = store.get("data_source", LIVE_DB_MODE)
         fine_result = build_manual_spectrum(
             concentrations=merged_concentrations,
             temperature_c=coarse_result.temperature_c,
@@ -797,6 +905,7 @@ def rebuild_selected_search_result(
             range_min=local_min_um,
             range_max=local_max_um,
             step_cm1=fine_step_cm1,
+            data_source=data_source,
         )
     except Exception:
         return coarse_result, coarse_result.step_cm1
@@ -824,6 +933,19 @@ app.layout = html.Div(
                     className="hero-badge",
                     children=[hero_logo()],
                 ),
+            ],
+        ),
+        html.Div(
+            className="offline-mode-strip",
+            children=[
+                dcc.Checklist(
+                    id="offline-mode",
+                    options=[{"label": "Schnelle offline DB verwenden", "value": OFFLINE_DB_MODE}],
+                    value=[],
+                    inline=True,
+                    className="offline-mode-toggle",
+                ),
+                html.Span(id="offline-mode-meta", className="offline-mode-meta"),
             ],
         ),
         dcc.Tabs(
@@ -880,11 +1002,11 @@ app.layout = html.Div(
                                                             children=[
                                                                 parameter_field(
                                                                     "T [°C]",
-                                                                    dcc.Input(id="manual-temperature", type="number", value=35.0, debounce=True, className="number-input", placeholder="35.0"),
+                                                                    dcc.Input(id="manual-temperature", type="number", value=35.0, className="number-input", placeholder="35.0"),
                                                                 ),
                                                                 parameter_field(
                                                                     "p [hPa]",
-                                                                    dcc.Input(id="manual-pressure", type="number", value=1035.0, debounce=True, className="number-input", placeholder="1035.0"),
+                                                                    dcc.Input(id="manual-pressure", type="number", value=1035.0, className="number-input", placeholder="1035.0"),
                                                                 ),
                                                                 parameter_field(
                                                                     "Bereichseinheit",
@@ -901,15 +1023,15 @@ app.layout = html.Div(
                                                                 ),
                                                                 parameter_field(
                                                                     "Schrittweite [cm⁻¹]",
-                                                                    dcc.Input(id="manual-step", type="number", value=0.01, step="any", min=0, debounce=True, inputMode="decimal", className="number-input", placeholder="0.01"),
+                                                                    dcc.Input(id="manual-step", type="number", value=0.01, step="any", min=0, inputMode="decimal", className="number-input", placeholder="0.01"),
                                                                 ),
                                                                 parameter_field(
                                                                     html.Span("λ Minimum [µm]", id="manual-range-min-label"),
-                                                                    dcc.Input(id="manual-range-min", type="number", value=3.22, debounce=True, className="number-input", placeholder="3.22"),
+                                                                    dcc.Input(id="manual-range-min", type="number", value=3.22, className="number-input", placeholder="3.22"),
                                                                 ),
                                                                 parameter_field(
                                                                     html.Span("λ Maximum [µm]", id="manual-range-max-label"),
-                                                                    dcc.Input(id="manual-range-max", type="number", value=3.24, debounce=True, className="number-input", placeholder="3.24"),
+                                                                    dcc.Input(id="manual-range-max", type="number", value=3.24, className="number-input", placeholder="3.24"),
                                                                 ),
                                                             ],
                                                         ),
@@ -962,9 +1084,26 @@ app.layout = html.Div(
                                                 html.Div(
                                                     className="button-row",
                                                     children=[
-                                                        html.Button("Spektrum berechnen", id="manual-run", className="action-button"),
-                                                        html.Button("Lokalen HITRAN-Cache aktualisieren", id="manual-fetch", className="secondary-button"),
+                                                        html.Div(
+                                                            className="button-lock-wrap",
+                                                            children=[
+                                                                html.Button("Spektrum berechnen", id="manual-run", className="action-button"),
+                                                                html.Div("Bitte warten...", id="manual-run-fetch-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
+                                                            ],
+                                                        ),
+                                                        html.Div(
+                                                            className="button-lock-wrap",
+                                                            children=[
+                                                                html.Button("Lokalen HITRAN-Cache aktualisieren", id="manual-fetch", className="secondary-button"),
+                                                                html.Div("Bitte warten...", id="manual-fetch-manual-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
+                                                                html.Div("Bitte warten...", id="manual-fetch-search-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
+                                                            ],
+                                                        ),
                                                     ],
+                                                ),
+                                                html.P(
+                                                    "Waehrend der HITRAN-Aktualisierung bitte keine neuen Berechnungen starten. Die ausgewaehlten Gase und die schnelle Offline-DB werden in dieser Zeit neu aufgebaut.",
+                                                    className="section-copy small",
                                                 ),
                                                 html.Div(id="manual-status", className="status-box"),
                                                 html.Div(id="manual-fetch-status", className="status-box"),
@@ -1073,11 +1212,11 @@ app.layout = html.Div(
                                                             children=[
                                                                 parameter_field(
                                                                     "T [°C]",
-                                                                    dcc.Input(id="search-temperature", type="number", value=35.0, debounce=True, className="number-input", placeholder="35.0"),
+                                                                    dcc.Input(id="search-temperature", type="number", value=35.0, className="number-input", placeholder="35.0"),
                                                                 ),
                                                                 parameter_field(
                                                                     "p [hPa]",
-                                                                    dcc.Input(id="search-pressure", type="number", value=1035.0, debounce=True, className="number-input", placeholder="1035.0"),
+                                                                    dcc.Input(id="search-pressure", type="number", value=1035.0, className="number-input", placeholder="1035.0"),
                                                                 ),
                                                                 parameter_field(
                                                                     "Bereichseinheit",
@@ -1094,19 +1233,19 @@ app.layout = html.Div(
                                                                 ),
                                                                 parameter_field(
                                                                     html.Span("λ Minimum [µm]", id="search-range-min-label"),
-                                                                    dcc.Input(id="search-range-min", type="number", value=2.0, debounce=True, className="number-input", placeholder="2.0"),
+                                                                    dcc.Input(id="search-range-min", type="number", value=2.0, className="number-input", placeholder="2.0"),
                                                                 ),
                                                                 parameter_field(
                                                                     html.Span("λ Maximum [µm]", id="search-range-max-label"),
-                                                                    dcc.Input(id="search-range-max", type="number", value=7.0, debounce=True, className="number-input", placeholder="7.0"),
+                                                                    dcc.Input(id="search-range-max", type="number", value=7.0, className="number-input", placeholder="7.0"),
                                                                 ),
                                                                 parameter_field(
                                                                     "Durchstimmbereich [nm]",
-                                                                    dcc.Input(id="search-tuning-range", type="number", value=20.0, debounce=True, className="number-input", placeholder="20.0"),
+                                                                    dcc.Input(id="search-tuning-range", type="number", value=20.0, className="number-input", placeholder="20.0"),
                                                                 ),
                                                                 parameter_field(
                                                                     "Maximale Laserzahl",
-                                                                    dcc.Input(id="search-max-lasers", type="number", value=3, debounce=True, className="number-input", placeholder="3"),
+                                                                    dcc.Input(id="search-max-lasers", type="number", value=3, className="number-input", placeholder="3"),
                                                                 ),
                                                                 parameter_field(
                                                                     "Beste Treffer [1-10]",
@@ -1114,7 +1253,7 @@ app.layout = html.Div(
                                                                 ),
                                                                 parameter_field(
                                                                     "Schrittweite [cm⁻¹]",
-                                                                    dcc.Input(id="search-step", type="number", value=0.02, step="any", min=0, debounce=True, inputMode="decimal", className="number-input", placeholder="0.02"),
+                                                                    dcc.Input(id="search-step", type="number", value=0.02, step="any", min=0, inputMode="decimal", className="number-input", placeholder="0.02"),
                                                                 ),
                                                             ],
                                                         ),
@@ -1125,7 +1264,13 @@ app.layout = html.Div(
                                         html.Div(
                                             className="sidebar-actions",
                                             children=[
-                                                html.Button("Bandensuche starten", id="search-run", className="action-button"),
+                                                html.Div(
+                                                    className="button-lock-wrap",
+                                                    children=[
+                                                        html.Button("Bandensuche starten", id="search-run", className="action-button"),
+                                                        html.Div("Bitte warten...", id="search-run-fetch-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
+                                                    ],
+                                                ),
                                                 html.Div(id="search-status", className="status-box"),
                                             ],
                                         ),
@@ -1237,6 +1382,46 @@ def sync_manual_range_inputs(
 
 
 @app.callback(
+    Output("offline-mode", "options"),
+    Output("offline-mode-meta", "children"),
+    Output("offline-mode", "value"),
+    Input("startup-hitran-check", "n_intervals"),
+    Input("manual-fetch-status", "children"),
+    State("offline-mode", "value"),
+)
+def refresh_offline_mode_state(
+    _startup_tick: int,
+    _refresh_message: str | None,
+    current_value: list[str] | None,
+) -> tuple[list[dict[str, Any]], str, list[str]]:
+    available, meta, option_value = offline_db_state()
+    selected_value = current_value or []
+    if not available:
+        selected_value = []
+    return [
+        {
+            "label": "Schnelle offline DB verwenden",
+            "value": option_value,
+            "disabled": not available,
+        }
+    ], meta, selected_value
+
+
+@app.callback(
+    Output("manual-temperature", "disabled"),
+    Output("manual-pressure", "disabled"),
+    Output("manual-step", "disabled"),
+    Output("search-temperature", "disabled"),
+    Output("search-pressure", "disabled"),
+    Output("search-step", "disabled"),
+    Input("offline-mode", "value"),
+)
+def sync_offline_disabled_state(selection: list[str] | None) -> tuple[bool, bool, bool, bool, bool, bool]:
+    disabled = offline_mode_enabled(selection)
+    return disabled, disabled, disabled, disabled, disabled, disabled
+
+
+@app.callback(
     Output("search-range-min", "value"),
     Output("search-range-max", "value"),
     Output("search-range-min-label", "children"),
@@ -1270,10 +1455,12 @@ def sync_search_range_inputs(
     State("manual-step", "value"),
     State("manual-temperature", "value"),
     State("manual-pressure", "value"),
+    State("offline-mode", "value"),
     *MANUAL_CONCENTRATION_STATES,
     running=[
         (Output("manual-run", "disabled"), True, False),
         (Output("manual-run", "children"), "Spektrum wird berechnet...", "Spektrum berechnen"),
+        (Output("manual-fetch-manual-lock", "style"), BUTTON_LOCK_VISIBLE, BUTTON_LOCK_HIDDEN),
     ],
 )
 def update_manual_spectrum(
@@ -1285,6 +1472,7 @@ def update_manual_spectrum(
     step_cm1: float,
     temperature_c: float,
     pressure_hpa: float,
+    offline_selection: list[str] | None,
     *concentration_state_values: Any,
 ) -> tuple[dict[str, Any] | None, str]:
     if not _n_clicks:
@@ -1294,14 +1482,18 @@ def update_manual_spectrum(
         gas_values = list(concentration_state_values[: len(ALL_GASES)])
         gas_units = list(concentration_state_values[len(ALL_GASES) :])
         concentrations = collect_concentrations(gas_values, gas_units, selected_gases)
+        data_source = OFFLINE_DB_MODE if offline_mode_enabled(offline_selection) else LIVE_DB_MODE
+        parsed_range_min = parse_required_number(range_min, "Minimum")
+        parsed_range_max = parse_required_number(range_max, "Maximum")
         manual_result = build_manual_spectrum(
             concentrations=concentrations,
             temperature_c=parse_required_number(temperature_c, "T [°C]"),
             pressure_hpa=parse_required_number(pressure_hpa, "p [hPa]"),
             range_unit=range_unit,
-            range_min=parse_required_number(range_min, "Minimum"),
-            range_max=parse_required_number(range_max, "Maximum"),
+            range_min=parsed_range_min,
+            range_max=parsed_range_max,
             step_cm1=parse_required_number(step_cm1, "Schrittweite [cm⁻¹]"),
+            data_source=data_source,
         )
         sampled_result = downsample_manual_result(manual_result)
         serialized = serialize_manual_result(sampled_result)
@@ -1309,14 +1501,20 @@ def update_manual_spectrum(
         serialized["display_range_unit"] = range_unit
         span_cm1 = abs(sampled_result.wavenumber_cm1.max() - sampled_result.wavenumber_cm1.min())
         suggested_step = recommended_step_cm1(span_cm1, manual_mode=True)
-        status = (
-            f"{len(sampled_result.components)} Komponenten geladen, {len(sampled_result.wavelength_um)} Plotpunkte. "
-            f"Wenn ein größerer Bereich langsam wird, ist für diese Spannweite etwa {suggested_step:.4f} cm⁻¹ sinnvoll. "
-            "Quelle: lokale HAPI/HITRAN-DB."
-        )
+        if data_source == OFFLINE_DB_MODE:
+            status = (
+                f"{len(sampled_result.components)} Komponenten geladen, {len(sampled_result.wavelength_um)} Plotpunkte. "
+                f"Quelle: schnelle Offline-DB mit {sampled_result.temperature_c:.1f} °C, {sampled_result.pressure_hpa:.2f} hPa und {sampled_result.step_cm1:.3f} cm⁻¹."
+            )
+        else:
+            status = (
+                f"{len(sampled_result.components)} Komponenten geladen, {len(sampled_result.wavelength_um)} Plotpunkte. "
+                f"Wenn ein größerer Bereich langsam wird, ist für diese Spannweite etwa {suggested_step:.4f} cm⁻¹ sinnvoll. "
+                "Quelle: lokale HAPI/HITRAN-DB."
+            )
         return serialized, status
     except Exception as exc:
-        return None, str(exc)
+        return None, format_data_source_error(exc, data_source, range_unit, range_min, range_max)
 
 
 @app.callback(
@@ -1368,6 +1566,12 @@ def render_manual_spectrum(
     State("manual-range-unit", "value"),
     State("manual-range-min", "value"),
     State("manual-range-max", "value"),
+    running=[
+        (Output("manual-fetch", "disabled"), True, False),
+        (Output("manual-fetch", "children"), "Lokaler HITRAN-Cache wird aktualisiert...", "Lokalen HITRAN-Cache aktualisieren"),
+        (Output("manual-run-fetch-lock", "style"), BUTTON_LOCK_VISIBLE, BUTTON_LOCK_HIDDEN),
+        (Output("search-run-fetch-lock", "style"), BUTTON_LOCK_VISIBLE, BUTTON_LOCK_HIDDEN),
+    ],
 )
 def refresh_manual_hitran_cache(
     n_clicks: int | None,
@@ -1462,11 +1666,13 @@ app.clientside_callback(
     State("search-max-lasers", "value"),
     State("search-result-limit", "value"),
     State("search-step", "value"),
+    State("offline-mode", "value"),
     *TARGET_CONCENTRATION_STATES,
     *INTERFERENCE_CONCENTRATION_STATES,
     running=[
         (Output("search-run", "disabled"), True, False),
         (Output("search-run", "children"), "Bandensuche läuft...", "Bandensuche starten"),
+        (Output("manual-fetch-search-lock", "style"), BUTTON_LOCK_VISIBLE, BUTTON_LOCK_HIDDEN),
     ],
 )
 def run_band_search(
@@ -1482,11 +1688,13 @@ def run_band_search(
     max_lasers: float,
     result_limit_value: float,
     step_cm1: float,
+    offline_selection: list[str] | None,
     *concentration_state_values: Any,
 ) -> tuple[list[int], dict[str, Any] | None, str]:
     if not _n_clicks:
         raise PreventUpdate
 
+    data_source = OFFLINE_DB_MODE if offline_mode_enabled(offline_selection) else LIVE_DB_MODE
     try:
         split_one = len(ALL_GASES)
         split_two = split_one * 2
@@ -1505,17 +1713,20 @@ def run_band_search(
             interference_units,
             selected_interference_gases,
         )
+        parsed_range_min = parse_required_number(range_min_value, "Minimum")
+        parsed_range_max = parse_required_number(range_max_value, "Maximum")
         plans, search_result = suggest_laser_plans(
             target_concentrations=target_concentrations,
             interference_concentrations=interference_concentrations,
             temperature_c=parse_required_number(temperature_c, "T [°C]"),
             pressure_hpa=parse_required_number(pressure_hpa, "p [hPa]"),
             range_unit=range_unit,
-            range_min=parse_required_number(range_min_value, "Minimum"),
-            range_max=parse_required_number(range_max_value, "Maximum"),
+            range_min=parsed_range_min,
+            range_max=parsed_range_max,
             tuning_range_nm=parse_required_number(tuning_range_nm, "Durchstimmbereich [nm]"),
             max_lasers=int(parse_required_number(max_lasers, "Maximale Laserzahl")),
             step_cm1=parse_required_number(step_cm1, "Schrittweite [cm⁻¹]"),
+            data_source=data_source,
         )
         result_limit = max(1, min(10, int(parse_required_number(result_limit_value, "Beste Treffer [1-10]"))))
         sampled_result = downsample_manual_result(search_result)
@@ -1526,6 +1737,7 @@ def run_band_search(
             target_concentrations=target_concentrations,
             interference_concentrations=interference_concentrations,
             range_unit=range_unit,
+            data_source=data_source,
         )
         if not plans:
             return [], store, "Keine geeigneten Laserfenster gefunden. Bereich vergrößern, weniger Zielgase pro Laser erzwingen oder Schrittweite vergrößern."
@@ -1537,9 +1749,13 @@ def run_band_search(
             status = (
                 f"{len(plans)} Vorschläge berechnet. Angezeigt werden die {len(visible_plans)} stärksten Treffer mit der besten Zielgas-Abdeckung und dem höchsten Signal-zu-Interferenz-Verhältnis."
             )
+        if data_source == OFFLINE_DB_MODE:
+            status += (
+                f" Quelle: schnelle Offline-DB ({search_result.temperature_c:.1f} °C, {search_result.pressure_hpa:.2f} hPa, {search_result.step_cm1:.3f} cm⁻¹)."
+            )
         return [0], store, status
     except Exception as exc:
-        return [], None, str(exc)
+        return [], None, format_data_source_error(exc, data_source, range_unit, range_min_value, range_max_value)
 
 
 @app.callback(

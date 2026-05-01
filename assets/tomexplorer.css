@@ -72,6 +72,28 @@ body {
   color: #1f3b2f;
 }
 
+.offline-mode-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 2px 0 8px;
+  padding: 0 4px;
+  color: #475569;
+}
+
+.offline-mode-toggle label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  color: #1f3b2f;
+}
+
+.offline-mode-meta {
+  font-size: 0.92rem;
+}
+
 .hero-text {
   margin: 8px 0 0;
   max-width: 54ch;
@@ -262,6 +284,26 @@ body {
   display: grid;
   grid-template-columns: 1fr;
   gap: 10px;
+}
+
+.button-lock-wrap {
+  position: relative;
+}
+
+.button-lock {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  align-items: center;
+  justify-content: center;
+  border-radius: 16px;
+  background: rgba(226, 232, 240, 0.78);
+  color: #475569;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  backdrop-filter: blur(1px);
+  cursor: not-allowed;
+  pointer-events: auto;
 }
 
 .action-button {
