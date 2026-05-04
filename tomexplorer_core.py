@@ -28,6 +28,8 @@ FETCH_MARGIN_CM1 = 5.0
 PICKLE_REBUILD_TEMPERATURE_C = 35.0
 PICKLE_REBUILD_PRESSURE_HPA = 1013.25
 LOCAL_CACHE_MAX_GASES = 10
+INTERFERENCE_WORST_CASE_SWEEP_FACTORS = (0.0, 0.5, 1.0)
+TARGET_WORST_CASE_SWEEP_FACTORS = (1.0, 2.0, 5.0)
 
 BASE_DIR = Path(__file__).resolve().parent
 LEGACY_DATA_DIR = BASE_DIR / "data"
@@ -241,6 +243,11 @@ class WindowGasMetric:
     peak_region_interference_contrast_per_cm: float = 0.0
     peak_region_selectivity: float = 0.0
     peak_region_purity: float = 0.0
+    peak_region_target_delta_alpha_per_cm: float = 0.0
+    peak_region_interference_delta_alpha_per_cm: float = 0.0
+    peak_region_delta_alpha_selectivity: float = 0.0
+    peak_region_wms2f_selectivity: float = 0.0
+    peak_region_wms2f_shape_similarity: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1079,15 +1086,33 @@ def hover_payload(result: ManualSpectrumResult, wavelength_um: float) -> dict[st
     return payload
 
 
-def _peak_candidates(signal: np.ndarray, max_candidates: int) -> np.ndarray:
+def _peak_candidates(
+    signal: np.ndarray,
+    competing_signal: np.ndarray,
+    max_candidates: int,
+) -> np.ndarray:
     if signal.size < 4 or np.max(signal) <= 0:
         return np.array([], dtype=int)
     prominence = max(np.max(signal) * 0.03, np.percentile(signal, 95) * 0.3)
     indices, _ = find_peaks(signal, prominence=prominence)
     if indices.size == 0:
         return np.array([int(np.argmax(signal))], dtype=int)
-    best = sorted(indices.tolist(), key=lambda idx: signal[idx], reverse=True)
-    return np.asarray(best[:max_candidates], dtype=int)
+    peak_indices = indices.tolist()
+    strongest = sorted(peak_indices, key=lambda idx: signal[idx], reverse=True)[:max_candidates]
+    most_selective = sorted(
+        peak_indices,
+        key=lambda idx: (
+            signal[idx] / (competing_signal[idx] + 1.0e-30),
+            signal[idx],
+        ),
+        reverse=True,
+    )[:max_candidates]
+
+    combined: list[int] = []
+    for idx in strongest + most_selective:
+        if idx not in combined:
+            combined.append(idx)
+    return np.asarray(combined, dtype=int)
 
 
 def _interval_overlap_fraction(
@@ -1113,6 +1138,43 @@ def _evaluate_window_candidate(
     seed_gas: str,
     seed_index: int,
 ) -> LaserWindowCandidate | None:
+    def peak_to_peak(profile: np.ndarray) -> float:
+        if profile.size == 0:
+            return 0.0
+        return float(np.max(profile) - np.min(profile))
+
+    def second_derivative_profile(profile: np.ndarray, axis: np.ndarray) -> np.ndarray:
+        if profile.size < 3:
+            return np.zeros_like(profile)
+        first_derivative = np.gradient(profile, axis)
+        return np.asarray(np.gradient(first_derivative, axis), dtype=float)
+
+    def normalized_shape(profile: np.ndarray) -> np.ndarray:
+        if profile.size == 0:
+            return np.zeros_like(profile)
+        centered = np.asarray(profile - float(np.mean(profile)), dtype=float)
+        scale = float(np.max(np.abs(centered)))
+        if scale <= 1.0e-30:
+            return np.zeros_like(centered)
+        return centered / scale
+
+    def wms2f_shape_similarity(
+        target_profile: np.ndarray,
+        total_profile: np.ndarray,
+        axis: np.ndarray,
+    ) -> float:
+        target_2f = normalized_shape(second_derivative_profile(target_profile, axis))
+        total_2f = normalized_shape(second_derivative_profile(total_profile, axis))
+        if target_2f.size < 2:
+            return 1.0
+        rmse = float(np.sqrt(np.mean((target_2f - total_2f) ** 2)))
+        correlation = float(np.corrcoef(target_2f, total_2f)[0, 1])
+        if not np.isfinite(correlation):
+            correlation = 1.0
+        rmse_similarity = max(0.0, 1.0 - (rmse / 2.0))
+        corr_similarity = min(1.0, max(0.0, (correlation + 1.0) / 2.0))
+        return float((rmse_similarity * 0.65) + (corr_similarity * 0.35))
+
     def peak_region_bounds(profile: np.ndarray, peak_index: int) -> tuple[int, int]:
         peak_value = float(profile[peak_index])
         if peak_value <= 0:
@@ -1144,19 +1206,15 @@ def _evaluate_window_candidate(
     if int(np.sum(mask)) < 8:
         return None
 
-    total_absorption = np.zeros(int(np.sum(mask)), dtype=float)
-    for gas in target_gases:
-        total_absorption += result.components[gas].alpha_per_cm[mask]
-    for gas in interference_gases:
-        if gas in result.components:
-            total_absorption += result.components[gas].alpha_per_cm[mask]
-
     coverage: list[str] = []
     gas_metrics: dict[str, WindowGasMetric] = {}
     score = 0.0
     center_wl = float(result.wavelength_um[seed_index])
     peak_region_selectivity_values: list[float] = []
     peak_region_purity_values: list[float] = []
+    delta_alpha_selectivity_values: list[float] = []
+    wms2f_selectivity_values: list[float] = []
+    wms2f_shape_similarity_values: list[float] = []
 
     for gas in target_gases:
         component = result.components[gas]
@@ -1173,25 +1231,120 @@ def _evaluate_window_candidate(
         local_wavenumbers = result.wavenumber_cm1[mask]
         peak_wl = float(local_wavelengths[local_peak_idx])
         peak_nu = float(local_wavenumbers[local_peak_idx])
-
-        other_profile = total_absorption - alpha_window
-        other_alpha = float(other_profile[local_peak_idx])
-        signal_to_interference = peak_alpha / (other_alpha + 1.0e-30)
         region_left, region_right = peak_region_bounds(alpha_window, local_peak_idx)
+        region_slice = slice(region_left, region_right + 1)
+        target_region = alpha_window[region_slice]
+        region_wavelengths = local_wavelengths[region_slice]
         target_baseline = peak_flank_baseline(alpha_window, region_left, region_right)
-        other_baseline = peak_flank_baseline(other_profile, region_left, region_right)
-        total_baseline = peak_flank_baseline(total_absorption, region_left, region_right)
         target_peak_contrast = max(0.0, peak_alpha - target_baseline)
-        other_peak_contrast = max(
-            0.0,
-            float(np.max(other_profile[region_left:region_right + 1])) - other_baseline,
+        target_delta_alpha = peak_to_peak(target_region)
+        target_wms2f = second_derivative_profile(target_region, region_wavelengths)
+        target_wms2f_span = peak_to_peak(target_wms2f)
+
+        nuisance_profiles = {
+            other_gas: result.components[other_gas].alpha_per_cm[mask]
+            for other_gas in sorted(set(interference_gases) | set(target_gases))
+            if other_gas != gas and other_gas in result.components
+        }
+        interference_nuisances = tuple(
+            other_gas for other_gas in interference_gases if other_gas in nuisance_profiles
         )
-        total_peak_contrast = max(
-            0.0,
-            float(np.max(total_absorption[region_left:region_right + 1])) - total_baseline,
+        target_nuisances = tuple(
+            other_gas for other_gas in target_gases if other_gas != gas and other_gas in nuisance_profiles
         )
-        peak_region_selectivity = target_peak_contrast / (other_peak_contrast + 1.0e-30)
-        peak_region_purity = target_peak_contrast / (total_peak_contrast + 1.0e-30)
+
+        scenario_scales: list[dict[str, float]] = []
+        scenario_signatures: set[tuple[tuple[str, float], ...]] = set()
+
+        def add_scenario(overrides: dict[str, float]) -> None:
+            scales = {other_gas: 1.0 for other_gas in nuisance_profiles}
+            scales.update(overrides)
+            signature = tuple(
+                (other_gas, round(scales[other_gas], 6))
+                for other_gas in sorted(scales)
+            )
+            if signature in scenario_signatures:
+                return
+            scenario_signatures.add(signature)
+            scenario_scales.append(scales)
+
+        add_scenario({})
+        for other_gas in interference_nuisances:
+            for factor in INTERFERENCE_WORST_CASE_SWEEP_FACTORS:
+                add_scenario({other_gas: factor})
+        for other_gas in target_nuisances:
+            for factor in TARGET_WORST_CASE_SWEEP_FACTORS:
+                add_scenario({other_gas: factor})
+        if target_nuisances:
+            add_scenario({other_gas: TARGET_WORST_CASE_SWEEP_FACTORS[-1] for other_gas in target_nuisances})
+
+        worst_signal_to_interference = float("inf")
+        worst_peak_region_selectivity = float("inf")
+        worst_peak_region_purity = 1.0
+        worst_delta_alpha_selectivity = float("inf")
+        worst_wms2f_selectivity = float("inf")
+        worst_wms2f_shape_similarity = 1.0
+        max_interference_alpha = 0.0
+        max_other_peak_contrast = 0.0
+        max_other_delta_alpha = 0.0
+
+        for scales in scenario_scales:
+            other_profile = np.zeros_like(alpha_window)
+            for other_gas, profile in nuisance_profiles.items():
+                other_profile += profile * scales.get(other_gas, 1.0)
+            total_profile = alpha_window + other_profile
+            other_region = other_profile[region_slice]
+            total_region = total_profile[region_slice]
+            other_alpha = float(other_profile[local_peak_idx])
+            signal_to_interference = peak_alpha / (other_alpha + 1.0e-30)
+            other_baseline = peak_flank_baseline(other_profile, region_left, region_right)
+            total_baseline = peak_flank_baseline(total_profile, region_left, region_right)
+            other_peak_contrast = max(
+                0.0,
+                float(np.max(other_region)) - other_baseline,
+            )
+            total_peak_contrast = max(
+                0.0,
+                float(np.max(total_region)) - total_baseline,
+            )
+            peak_region_selectivity = target_peak_contrast / (other_peak_contrast + 1.0e-30)
+            peak_region_purity = min(
+                1.0,
+                max(0.0, target_peak_contrast / (total_peak_contrast + 1.0e-30)),
+            )
+            other_delta_alpha = peak_to_peak(other_region)
+            delta_alpha_selectivity = target_delta_alpha / (other_delta_alpha + 1.0e-30)
+            other_wms2f = second_derivative_profile(other_region, region_wavelengths)
+            other_wms2f_span = peak_to_peak(other_wms2f)
+            wms2f_selectivity = target_wms2f_span / (other_wms2f_span + 1.0e-30)
+            wms2f_shape_similarity_score = wms2f_shape_similarity(
+                target_region,
+                total_region,
+                region_wavelengths,
+            )
+
+            worst_signal_to_interference = min(worst_signal_to_interference, signal_to_interference)
+            worst_peak_region_selectivity = min(worst_peak_region_selectivity, peak_region_selectivity)
+            worst_peak_region_purity = min(worst_peak_region_purity, peak_region_purity)
+            worst_delta_alpha_selectivity = min(worst_delta_alpha_selectivity, delta_alpha_selectivity)
+            worst_wms2f_selectivity = min(worst_wms2f_selectivity, wms2f_selectivity)
+            worst_wms2f_shape_similarity = min(
+                worst_wms2f_shape_similarity,
+                wms2f_shape_similarity_score,
+            )
+            max_interference_alpha = max(max_interference_alpha, other_alpha)
+            max_other_peak_contrast = max(max_other_peak_contrast, other_peak_contrast)
+            max_other_delta_alpha = max(max_other_delta_alpha, other_delta_alpha)
+
+        other_alpha = max_interference_alpha
+        signal_to_interference = worst_signal_to_interference
+        other_peak_contrast = max_other_peak_contrast
+        peak_region_selectivity = worst_peak_region_selectivity
+        peak_region_purity = worst_peak_region_purity
+        other_delta_alpha = max_other_delta_alpha
+        delta_alpha_selectivity = worst_delta_alpha_selectivity
+        wms2f_selectivity = worst_wms2f_selectivity
+        wms2f_shape_similarity_score = worst_wms2f_shape_similarity
         gas_peak = float(np.max(component.alpha_per_cm))
         prominence_ratio = peak_alpha / (gas_peak + 1.0e-30)
         if prominence_ratio < 0.12:
@@ -1200,10 +1353,16 @@ def _evaluate_window_candidate(
         coverage.append(gas)
         peak_region_selectivity_values.append(peak_region_selectivity)
         peak_region_purity_values.append(peak_region_purity)
+        delta_alpha_selectivity_values.append(delta_alpha_selectivity)
+        wms2f_selectivity_values.append(wms2f_selectivity)
+        wms2f_shape_similarity_values.append(wms2f_shape_similarity_score)
         score += (prominence_ratio * 42.0)
         score += min(signal_to_interference, 25.0) * 6.0
         score += min(peak_region_selectivity, 25.0) * 14.0
         score += min(max(0.0, peak_region_purity), 1.0) * 95.0
+        score += min(delta_alpha_selectivity, 25.0) * 10.0
+        score += min(wms2f_selectivity, 25.0) * 12.0
+        score += min(max(0.0, wms2f_shape_similarity_score), 1.0) * 150.0
         gas_metrics[gas] = WindowGasMetric(
             gas=gas,
             peak_alpha_per_cm=peak_alpha,
@@ -1218,6 +1377,11 @@ def _evaluate_window_candidate(
             peak_region_interference_contrast_per_cm=float(other_peak_contrast),
             peak_region_selectivity=float(peak_region_selectivity),
             peak_region_purity=float(peak_region_purity),
+            peak_region_target_delta_alpha_per_cm=float(target_delta_alpha),
+            peak_region_interference_delta_alpha_per_cm=float(other_delta_alpha),
+            peak_region_delta_alpha_selectivity=float(delta_alpha_selectivity),
+            peak_region_wms2f_selectivity=float(wms2f_selectivity),
+            peak_region_wms2f_shape_similarity=float(wms2f_shape_similarity_score),
         )
 
     if seed_gas not in gas_metrics:
@@ -1236,6 +1400,12 @@ def _evaluate_window_candidate(
     mean_peak_region_selectivity = sum(peak_region_selectivity_values) / len(peak_region_selectivity_values)
     worst_peak_region_purity = min(peak_region_purity_values)
     mean_peak_region_purity = sum(peak_region_purity_values) / len(peak_region_purity_values)
+    worst_delta_alpha_selectivity = min(delta_alpha_selectivity_values)
+    mean_delta_alpha_selectivity = sum(delta_alpha_selectivity_values) / len(delta_alpha_selectivity_values)
+    worst_wms2f_selectivity = min(wms2f_selectivity_values)
+    mean_wms2f_selectivity = sum(wms2f_selectivity_values) / len(wms2f_selectivity_values)
+    worst_wms2f_shape_similarity = min(wms2f_shape_similarity_values)
+    mean_wms2f_shape_similarity = sum(wms2f_shape_similarity_values) / len(wms2f_shape_similarity_values)
 
     required_min_um = min(metric.peak_wavelength_um for metric in gas_metrics.values())
     required_max_um = max(metric.peak_wavelength_um for metric in gas_metrics.values())
@@ -1250,6 +1420,12 @@ def _evaluate_window_candidate(
     score -= max(0.0, 4.0 - mean_peak_region_selectivity) * 52.0
     score -= max(0.0, 0.72 - worst_peak_region_purity) * 260.0
     score -= max(0.0, 0.82 - mean_peak_region_purity) * 110.0
+    score -= max(0.0, 2.0 - worst_delta_alpha_selectivity) * 220.0
+    score -= max(0.0, 4.0 - mean_delta_alpha_selectivity) * 80.0
+    score -= max(0.0, 1.5 - worst_wms2f_selectivity) * 260.0
+    score -= max(0.0, 3.0 - mean_wms2f_selectivity) * 90.0
+    score -= max(0.0, 0.72 - worst_wms2f_shape_similarity) * 320.0
+    score -= max(0.0, 0.84 - mean_wms2f_shape_similarity) * 140.0
     score -= required_span_nm * 12.0
     score -= max(0.0, required_span_nm - 2.0) * 6.0
 
@@ -1310,7 +1486,12 @@ def suggest_laser_plans(
 
     for gas in target_gases:
         signal = manual_result.components[gas].alpha_per_cm
-        peak_indices = _peak_candidates(signal, max_candidates=max_peak_candidates_per_gas)
+        competing_signal = manual_result.total_alpha_per_cm - signal
+        peak_indices = _peak_candidates(
+            signal,
+            competing_signal=competing_signal,
+            max_candidates=max_peak_candidates_per_gas,
+        )
         for peak_index in peak_indices:
             peak_wl = float(manual_result.wavelength_um[peak_index])
             window_min = max(wavelength_min_um, peak_wl - half_window_um)

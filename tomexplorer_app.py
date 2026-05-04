@@ -830,6 +830,35 @@ def format_laser_window_range(window: Any, range_unit: str) -> str:
     return f"{window.wavelength_min_um:.4f}-{window.wavelength_max_um:.4f} µm | {window.tuning_span_nm:.2f} nm"
 
 
+def plan_worst_case_metrics(plan: LaserPlan) -> dict[str, float]:
+    metrics = [metric for window in plan.windows for metric in window.gas_metrics.values()]
+    if not metrics:
+        return {
+            "signal_to_interference": 0.0,
+            "delta_alpha_selectivity": 0.0,
+            "wms2f_selectivity": 0.0,
+            "wms2f_shape_similarity": 0.0,
+        }
+    return {
+        "signal_to_interference": min(metric.signal_to_interference for metric in metrics),
+        "delta_alpha_selectivity": min(metric.peak_region_delta_alpha_selectivity for metric in metrics),
+        "wms2f_selectivity": min(metric.peak_region_wms2f_selectivity for metric in metrics),
+        "wms2f_shape_similarity": min(metric.peak_region_wms2f_shape_similarity for metric in metrics),
+    }
+
+
+def format_plan_worst_case_metrics(plan: LaserPlan) -> str:
+    metrics = plan_worst_case_metrics(plan)
+    return " | ".join(
+        [
+            f"S/I {metrics['signal_to_interference']:.2f}",
+            f"Δα-Sel {metrics['delta_alpha_selectivity']:.2f}",
+            f"2f-Sel {metrics['wms2f_selectivity']:.2f}",
+            f"2f-Fit {metrics['wms2f_shape_similarity']:.2f}",
+        ]
+    )
+
+
 def search_table_rows(plans: list[LaserPlan], range_unit: str) -> list[dict[str, Any]]:
     rows = []
     for plan in plans:
@@ -842,6 +871,7 @@ def search_table_rows(plans: list[LaserPlan], range_unit: str) -> list[dict[str,
                 "covered": ", ".join(plan.covered_targets),
                 "missing": ", ".join(plan.missing_targets) or "-",
                 "ranges": ranges,
+                "robustness": format_plan_worst_case_metrics(plan),
             }
         )
     return rows
@@ -941,7 +971,7 @@ app.layout = html.Div(
                 dcc.Checklist(
                     id="offline-mode",
                     options=[{"label": "Schnelle offline DB verwenden", "value": OFFLINE_DB_MODE}],
-                    value=[],
+                    value=[OFFLINE_DB_MODE],
                     inline=True,
                     className="offline-mode-toggle",
                 ),
@@ -1291,6 +1321,7 @@ app.layout = html.Div(
                                                         {"name": "Abgedeckt", "id": "covered"},
                                                         {"name": "Fehlt", "id": "missing"},
                                                         {"name": "Laserfenster", "id": "ranges"},
+                                                        {"name": "Worst-Case", "id": "robustness"},
                                                     ],
                                                     data=[],
                                                     row_selectable="single",
@@ -1871,6 +1902,10 @@ def update_search_plot(selected_rows: list[int], range_unit: str, store: dict[st
                         f"ν {metric.peak_wavenumber_cm1:.2f} cm⁻¹",
                         f"σ {metric.peak_sigma_cm2_per_molecule:.2e}",
                         f"α {metric.peak_alpha_per_cm:.2e}",
+                        f"WC S/I {metric.signal_to_interference:.2f}",
+                        f"WC Δα-Sel {metric.peak_region_delta_alpha_selectivity:.2f}",
+                        f"WC 2f-Sel {metric.peak_region_wms2f_selectivity:.2f}",
+                        f"WC 2f-Fit {metric.peak_region_wms2f_shape_similarity:.2f}",
                         format_concentration(float(concentration)),
                     ]
                 )
