@@ -70,9 +70,7 @@
     return [];
   }
 
-  function currentGraphHoverData(graphId) {
-    const graphHost = document.getElementById(graphId);
-    const graph = graphHost ? graphHost.querySelector(".js-plotly-plot") : null;
+  function hoverDataFromPlot(graph) {
     if (!graph || !Array.isArray(graph._hoverdata) || graph._hoverdata.length === 0) {
       return null;
     }
@@ -88,6 +86,23 @@
         },
       ],
     };
+  }
+
+  function currentGraphHoverData(graphId) {
+    const graphHost = document.getElementById(graphId);
+    const graph = graphHost ? graphHost.querySelector(".js-plotly-plot") : null;
+    return hoverDataFromPlot(graph);
+  }
+
+  function currentSearchHoverData() {
+    const detailPlots = Array.from(document.querySelectorAll(".search-window-graph .js-plotly-plot"));
+    for (const graph of detailPlots) {
+      const hoverData = hoverDataFromPlot(graph);
+      if (hoverData) {
+        return hoverData;
+      }
+    }
+    return currentGraphHoverData("search-graph");
   }
 
   function getDashComponentProps(componentId) {
@@ -136,28 +151,27 @@
     ]);
   }
 
-  function syncHoverPanel(graphId, panelId, storeId, selectResult) {
-    const graphHost = document.getElementById(graphId);
-    const graph = graphHost ? graphHost.querySelector(".js-plotly-plot") : null;
-    if (!graph) {
+  function syncHoverPanel(graphId, panelId, storeId, selectResult, hoverDataResolver) {
+    const panelHost = document.getElementById(panelId);
+    if (!panelHost) {
       return;
     }
 
     const props = getDashComponentProps(storeId);
     const serializedResult = selectResult(props ? props.data : null);
-    const hoverData = currentGraphHoverData(graphId);
+    const hoverData = typeof hoverDataResolver === "function" ? hoverDataResolver(graphId) : currentGraphHoverData(graphId);
     const signatureKey = `__tomExplorerHoverSignature_${panelId}`;
     const signature = hoverSignature(hoverData, serializedResult);
-    if (graph[signatureKey] === signature) {
+    if (panelHost[signatureKey] === signature) {
       return;
     }
-    graph[signatureKey] = signature;
+    panelHost[signatureKey] = signature;
     setPanelChildren(panelId, buildHoverChildren(hoverData, serializedResult));
   }
 
   function ensureHoverPolling() {
     syncHoverPanel("manual-graph", "manual-hover-panel", "manual-spectrum-store", (data) => data || null);
-    syncHoverPanel("search-graph", "search-hover-panel", "search-store", (data) => (data && data.spectrum ? data.spectrum : null));
+    syncHoverPanel("search-graph", "search-hover-panel", "search-store", (data) => (data && data.spectrum ? data.spectrum : null), () => currentSearchHoverData());
   }
 
   function buildHoverChildren(hoverData, serializedResult) {
@@ -250,7 +264,7 @@
         return buildHoverChildren(liveHoverData || hoverData, serializedResult);
       },
       search_hover_children: function (hoverData, store, currentChildren) {
-        const liveHoverData = currentGraphHoverData("search-graph");
+        const liveHoverData = currentSearchHoverData();
         return buildHoverChildren(liveHoverData || hoverData, store && store.spectrum ? store.spectrum : null);
       },
     },

@@ -21,6 +21,7 @@ from tomexplorer_core import (
     GAS_LIBRARY,
     LaserPlan,
     LIVE_DB_MODE,
+    ManualSpectrumResult,
     OFFLINE_DB_MODE,
     PICKLE_REBUILD_PRESSURE_HPA,
     PICKLE_REBUILD_TEMPERATURE_C,
@@ -877,6 +878,212 @@ def search_table_rows(plans: list[LaserPlan], range_unit: str) -> list[dict[str,
     return rows
 
 
+def empty_search_plan_details() -> html.Div:
+    return html.Div(
+        className="search-plan-details",
+        children=[
+            html.Div(
+                className="search-plan-summary",
+                children=[
+                    html.Span(
+                        "Nach Auswahl eines Treffers erscheinen hier kompakte Detailkarten pro Laserfenster.",
+                        className="section-copy",
+                    )
+                ],
+            )
+        ],
+    )
+
+
+def empty_search_window_plots() -> html.Div:
+    return html.Div(className="search-window-plot-grid")
+
+
+def search_plot_x_range(x_values: np.ndarray, x_unit: str, x_min: float, x_max: float) -> list[float]:
+    if x_unit == "cm-1":
+        center_value = (x_min + x_max) / 2.0
+        center_wavelength_um = float(wavenumber_cm1_to_wavelength_um(center_value))
+        min_padding = abs(
+            float(wavelength_um_to_wavenumber_cm1(center_wavelength_um - SEARCH_PLOT_PADDING_UM))
+            - float(wavelength_um_to_wavenumber_cm1(center_wavelength_um + SEARCH_PLOT_PADDING_UM))
+        ) / 2.0
+    else:
+        min_padding = SEARCH_PLOT_PADDING_UM
+    zoom_padding = max((x_max - x_min) * 0.08, min_padding)
+    x_range = [
+        max(float(np.min(x_values)), x_min - zoom_padding),
+        min(float(np.max(x_values)), x_max + zoom_padding),
+    ]
+    if x_unit == "cm-1":
+        return [x_range[1], x_range[0]]
+    return x_range
+
+
+def search_plot_y_range(
+    result: ManualSpectrumResult,
+    x_values: np.ndarray,
+    x_range: list[float],
+    log_y: bool,
+) -> list[float] | None:
+    mask = (x_values >= min(x_range)) & (x_values <= max(x_range))
+    local_alpha = result.total_alpha_per_cm[mask]
+    if not local_alpha.size or log_y:
+        return None
+    local_max = float(np.max(local_alpha))
+    local_min = float(np.min(local_alpha))
+    span = local_max - local_min
+    padding = max(span * 0.15, local_max * 0.08, 1.0e-12)
+    return [0.0, local_max + padding]
+
+
+def build_search_window_plots(
+    plan: LaserPlan,
+    store: dict[str, Any],
+    range_unit: str,
+    log_y: bool,
+    log_level: int,
+    result: ManualSpectrumResult,
+    fine_step_cm1: float,
+) -> html.Div:
+    x_values = spectrum_x_values(result, range_unit)
+    plot_cards: list[html.Div] = []
+
+    for index, window in enumerate(plan.windows, start=1):
+        window_highlight = {
+            "x_min": float(wavelength_um_to_wavenumber_cm1(window.wavelength_max_um)) if range_unit == "cm-1" else window.wavelength_min_um,
+            "x_max": float(wavelength_um_to_wavenumber_cm1(window.wavelength_min_um)) if range_unit == "cm-1" else window.wavelength_max_um,
+        }
+        highlighted_lines = [
+            {
+                "x_value": float(metric.peak_wavenumber_cm1) if range_unit == "cm-1" else metric.peak_wavelength_um,
+                "color": result.components[gas].color,
+                "label": display_formula(gas),
+            }
+            for gas, metric in sorted(window.gas_metrics.items(), key=lambda item: item[1].peak_wavelength_um)
+        ]
+        x_range = search_plot_x_range(
+            x_values,
+            range_unit,
+            min(window_highlight["x_min"], window_highlight["x_max"]),
+            max(window_highlight["x_min"], window_highlight["x_max"]),
+        )
+        y_range = search_plot_y_range(result, x_values, x_range, log_y)
+        title = (
+            f"Laser {index} | {', '.join(display_formula(gas) for gas in window.coverage)}"
+            if window.coverage
+            else f"Laser {index}"
+        )
+        figure = make_spectrum_figure(
+            store["spectrum"],
+            y_mode="alpha",
+            log_y=log_y,
+            log_level=int(log_level),
+            title=title,
+            x_unit=range_unit,
+            highlighted_windows=[window_highlight],
+            highlighted_lines=highlighted_lines,
+            x_range=x_range,
+            y_range=y_range,
+            revision_key=f"search-window:{plan.rank}:{window.window_id}:{range_unit}",
+            preserve_ui_state=False,
+        )
+        figure.update_layout(height=360, meta={**(figure.layout.meta or {}), "step_cm1": fine_step_cm1})
+        plot_cards.append(
+            html.Div(
+                className="search-window-plot-card",
+                children=[
+                    dcc.Graph(
+                        figure=figure,
+                        className="search-window-graph",
+                        clear_on_unhover=False,
+                    )
+                ],
+            )
+        )
+
+    return html.Div(className="search-window-plot-grid", children=plot_cards)
+
+
+def build_search_plan_details(plan: LaserPlan, store: dict[str, Any], range_unit: str) -> html.Div:
+    target_concentrations = store.get("target_concentrations", {})
+    interference_concentrations = store.get("interference_concentrations", {})
+    cards: list[html.Div] = []
+
+    for index, window in enumerate(plan.windows, start=1):
+        coverage_pills = [
+            html.Span(
+                display_formula(gas),
+                className="search-laser-pill",
+                style={
+                    "backgroundColor": GAS_LIBRARY[gas].get("plot_color", GAS_LIBRARY[gas]["color"]),
+                },
+            )
+            for gas in window.coverage
+        ]
+        rows: list[html.Div] = []
+        for gas, metric in sorted(window.gas_metrics.items(), key=lambda item: item[1].peak_wavelength_um):
+            concentration = target_concentrations.get(gas)
+            role_label = "Ziel"
+            if concentration is None:
+                concentration = interference_concentrations.get(gas, 0.0)
+                role_label = "Stoer"
+            rows.append(
+                html.Div(
+                    className="search-laser-metric-row",
+                    children=[
+                        html.Span(
+                            display_formula(gas),
+                            className="search-laser-gas",
+                            style={"color": GAS_LIBRARY[gas].get("plot_color", GAS_LIBRARY[gas]["color"])} ,
+                        ),
+                        html.Span(f"{metric.peak_wavelength_um:.4f} um", className="search-laser-metric-text"),
+                        html.Span(f"alpha {metric.peak_alpha_per_cm:.2e}", className="search-laser-metric-text"),
+                        html.Span(
+                            f"S/I {metric.signal_to_interference:.2f} | dA {metric.peak_region_delta_alpha_selectivity:.2f} | 2f {metric.peak_region_wms2f_selectivity:.2f}/{metric.peak_region_wms2f_shape_similarity:.2f}",
+                            className="search-laser-metric-text",
+                        ),
+                        html.Span(f"{role_label} {format_concentration(float(concentration))}", className="search-laser-metric-text search-laser-metric-meta"),
+                    ],
+                )
+            )
+
+        cards.append(
+            html.Div(
+                className="search-laser-card",
+                children=[
+                    html.Div(
+                        className="search-laser-card-header",
+                        children=[
+                            html.Div(
+                                children=[
+                                    html.H4(f"Laser {index}", className="hover-title"),
+                                    html.P(format_laser_window_range(window, range_unit), className="section-copy small"),
+                                ]
+                            ),
+                            html.Div(className="search-laser-coverage", children=coverage_pills),
+                        ],
+                    ),
+                    html.Div(className="search-laser-metric-table", children=rows),
+                ],
+            )
+        )
+
+    summary_bits = [
+        html.Strong(f"Rang {plan.rank} | Score {plan.score:.1f}"),
+        html.Span(f"Abgedeckt: {', '.join(display_formula(gas) for gas in plan.covered_targets)}"),
+        html.Span(
+            "Fehlt: " + (", ".join(display_formula(gas) for gas in plan.missing_targets) if plan.missing_targets else "-")
+        ),
+    ]
+    return html.Div(
+        className="search-plan-details",
+        children=[
+            html.Div(className="search-plan-summary", children=summary_bits),
+            html.Div(className="search-laser-card-grid", children=cards),
+        ],
+    )
+
+
 def build_search_store(
     plans: list[LaserPlan],
     serialized_spectrum: dict[str, Any],
@@ -1338,19 +1545,53 @@ app.layout = html.Div(
                                             type="circle",
                                             children=[
                                                 html.Div(
-                                                    className="graph-stack",
+                                                    className="graph-stack search-graph-stack",
                                                     children=[
+                                                        html.Div(
+                                                            className="toggle-row search-graph-toolbar",
+                                                            children=[
+                                                                dcc.Checklist(
+                                                                    id="search-log-scale",
+                                                                    options=[{"label": "Log y", "value": "log"}],
+                                                                    value=[],
+                                                                    inline=True,
+                                                                ),
+                                                                html.Div(
+                                                                    className="log-level-wrap",
+                                                                    children=[
+                                                                        html.Span("Log [Dekaden 1-5]", className="field-label"),
+                                                                        dcc.Slider(
+                                                                            id="search-log-level",
+                                                                            min=1,
+                                                                            max=5,
+                                                                            step=1,
+                                                                            value=3,
+                                                                            marks={level: str(level) for level in range(1, 6)},
+                                                                            included=False,
+                                                                        ),
+                                                                    ],
+                                                                ),
+                                                            ],
+                                                        ),
                                                         dcc.Graph(
                                                             id="search-graph",
                                                             figure=empty_figure("Bandensuche starten und eine Zeile auswählen, um das Spektrum zu prüfen."),
                                                             className="main-graph",
                                                             clear_on_unhover=False,
                                                         ),
+                                                        html.Div(
+                                                            id="search-window-figures",
+                                                            children=empty_search_window_plots(),
+                                                        ),
+                                                        html.Div(
+                                                            id="search-plan-details",
+                                                            children=empty_search_plan_details(),
+                                                        ),
                                                     ],
                                                 ),
                                             ],
                                         ),
-                                        html.Div(id="search-hover-panel", children=hover_panel(None)),
+                                        html.Div(id="search-hover-panel", className="search-hover-panel", children=hover_panel(None)),
                                         dcc.Store(id="search-store"),
                                         dcc.Store(id="search-range-unit-store", data="um"),
                                     ],
@@ -1803,13 +2044,27 @@ def sync_search_results_table(range_unit: str, store: dict[str, Any] | None) -> 
 
 @app.callback(
     Output("search-graph", "figure"),
+    Output("search-window-figures", "children"),
+    Output("search-plan-details", "children"),
     Input("search-results-table", "selected_rows"),
     Input("search-range-unit", "value"),
+    Input("search-log-scale", "value"),
+    Input("search-log-level", "value"),
     State("search-store", "data"),
 )
-def update_search_plot(selected_rows: list[int], range_unit: str, store: dict[str, Any] | None) -> go.Figure:
+def update_search_plot(
+    selected_rows: list[int],
+    range_unit: str,
+    log_scale: list[str],
+    log_level: int,
+    store: dict[str, Any] | None,
+) -> tuple[go.Figure, html.Div, html.Div]:
     if not store or not store.get("plans"):
-        return empty_figure("Bandensuche starten und eine Zeile auswählen, um das Spektrum zu prüfen.")
+        return (
+            empty_figure("Bandensuche starten und eine Zeile auswählen, um das Spektrum zu prüfen."),
+            empty_search_window_plots(),
+            empty_search_plan_details(),
+        )
     row_index = selected_rows[0] if selected_rows else 0
     if row_index >= len(store["plans"]):
         row_index = 0
@@ -1841,31 +2096,9 @@ def update_search_plot(selected_rows: list[int], range_unit: str, store: dict[st
     zoom_min = min(min(window["x_min"], window["x_max"]) for window in highlighted_windows)
     zoom_max = max(max(window["x_min"], window["x_max"]) for window in highlighted_windows)
     x_values = spectrum_x_values(result, x_unit)
-    if x_unit == "cm-1":
-        center_value = (zoom_min + zoom_max) / 2.0
-        center_wavelength_um = float(wavenumber_cm1_to_wavelength_um(center_value))
-        min_padding = abs(
-            float(wavelength_um_to_wavenumber_cm1(center_wavelength_um - SEARCH_PLOT_PADDING_UM))
-            - float(wavelength_um_to_wavenumber_cm1(center_wavelength_um + SEARCH_PLOT_PADDING_UM))
-        ) / 2.0
-    else:
-        min_padding = SEARCH_PLOT_PADDING_UM
-    zoom_padding = max((zoom_max - zoom_min) * 0.08, min_padding)
-    x_range = [
-        max(float(np.min(x_values)), zoom_min - zoom_padding),
-        min(float(np.max(x_values)), zoom_max + zoom_padding),
-    ]
-    if x_unit == "cm-1":
-        x_range = [x_range[1], x_range[0]]
-    mask = (x_values >= min(x_range)) & (x_values <= max(x_range))
-    local_alpha = result.total_alpha_per_cm[mask]
-    y_range: list[float] | None = None
-    if local_alpha.size:
-        local_max = float(np.max(local_alpha))
-        local_min = float(np.min(local_alpha))
-        span = local_max - local_min
-        padding = max(span * 0.15, local_max * 0.08, 1.0e-12)
-        y_range = [0.0, local_max + padding]
+    x_range = search_plot_x_range(x_values, x_unit, zoom_min, zoom_max)
+    log_y = "log" in (log_scale or [])
+    y_range = search_plot_y_range(result, x_values, x_range, log_y)
     covered_label = ", ".join(plan.covered_targets[:4])
     if len(plan.covered_targets) > 4:
         covered_label += f" +{len(plan.covered_targets) - 4}"
@@ -1876,7 +2109,8 @@ def update_search_plot(selected_rows: list[int], range_unit: str, store: dict[st
     figure = make_spectrum_figure(
         store["spectrum"],
         y_mode="alpha",
-        log_y=False,
+        log_y=log_y,
+        log_level=int(log_level),
         title=title,
         x_unit=x_unit,
         highlighted_windows=highlighted_windows,
@@ -1887,47 +2121,11 @@ def update_search_plot(selected_rows: list[int], range_unit: str, store: dict[st
         preserve_ui_state=False,
     )
     figure.update_layout(meta={**(figure.layout.meta or {}), "step_cm1": fine_step_cm1})
-
-    annotation_lines: list[str] = []
-    for window in plan.windows:
-        for gas, metric in sorted(window.gas_metrics.items()):
-            concentration = store.get("target_concentrations", {}).get(gas)
-            if concentration is None:
-                concentration = store.get("interference_concentrations", {}).get(gas, 0.0)
-            annotation_lines.append(
-                " | ".join(
-                    [
-                        display_formula(gas),
-                        f"λ {metric.peak_wavelength_um:.4f} µm",
-                        f"ν {metric.peak_wavenumber_cm1:.2f} cm⁻¹",
-                        f"σ {metric.peak_sigma_cm2_per_molecule:.2e}",
-                        f"α {metric.peak_alpha_per_cm:.2e}",
-                        f"WC S/I {metric.signal_to_interference:.2f}",
-                        f"WC Δα-Sel {metric.peak_region_delta_alpha_selectivity:.2f}",
-                        f"WC 2f-Sel {metric.peak_region_wms2f_selectivity:.2f}",
-                        f"WC 2f-Fit {metric.peak_region_wms2f_shape_similarity:.2f}",
-                        format_concentration(float(concentration)),
-                    ]
-                )
-            )
-
-    if annotation_lines:
-        figure.add_annotation(
-            x=0.995,
-            y=0.995,
-            xref="paper",
-            yref="paper",
-            xanchor="right",
-            yanchor="top",
-            align="left",
-            showarrow=False,
-            font={"size": 10, "family": BODY_FONT, "color": "#1f2937"},
-            bgcolor="rgba(255, 253, 248, 0.88)",
-            bordercolor="rgba(148, 163, 184, 0.35)",
-            borderwidth=1,
-            text="<br>".join(annotation_lines[:8]),
-        )
-    return figure
+    return (
+        figure,
+        build_search_window_plots(plan, store, range_unit, log_y, int(log_level), result, fine_step_cm1),
+        build_search_plan_details(plan, store, range_unit),
+    )
 
 
 app.clientside_callback(

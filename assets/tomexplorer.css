@@ -371,6 +371,137 @@ body {
   gap: 8px;
 }
 
+.search-graph-stack {
+  padding-bottom: 250px;
+}
+
+.search-graph-toolbar {
+  width: fit-content;
+  max-width: min(100%, 480px);
+  padding: 10px 14px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 18px;
+  background: rgba(255, 253, 248, 0.88);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+}
+
+.search-graph-toolbar .log-level-wrap {
+  min-width: 180px;
+  flex: 0 1 220px;
+}
+
+.search-plan-details {
+  display: grid;
+  gap: 12px;
+}
+
+.search-window-plot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.search-window-plot-card {
+  padding: 8px;
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.8);
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
+}
+
+.search-window-graph {
+  min-height: 360px;
+}
+
+.search-hover-panel {
+  position: fixed;
+  left: clamp(24px, 31vw, 430px);
+  right: 24px;
+  bottom: 16px;
+  z-index: 40;
+  max-height: min(38vh, 340px);
+  overflow: auto;
+}
+
+.search-plan-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+  padding: 12px 14px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(226, 232, 240, 0.95);
+}
+
+.search-laser-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.search-laser-card {
+  padding: 14px 16px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
+}
+
+.search-laser-card-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+
+.search-laser-coverage {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.search-laser-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: #fffdf8;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.search-laser-metric-table {
+  display: grid;
+  gap: 8px;
+}
+
+.search-laser-metric-row {
+  display: grid;
+  grid-template-columns: 72px 96px 112px minmax(0, 1.5fr) 110px;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(248, 250, 252, 0.92);
+}
+
+.search-laser-gas {
+  font-weight: 800;
+}
+
+.search-laser-metric-text {
+  color: #334155;
+  font-size: 0.88rem;
+}
+
+.search-laser-metric-meta {
+  justify-self: end;
+  font-weight: 700;
+}
+
 .hover-card {
   padding: 14px 16px;
 }
@@ -431,6 +562,19 @@ body {
     overflow: visible;
     padding-right: 0;
   }
+
+  .search-graph-stack {
+    padding-bottom: 0;
+  }
+
+  .search-hover-panel {
+    position: static;
+    left: auto;
+    right: auto;
+    bottom: auto;
+    max-height: none;
+    overflow: visible;
+  }
 }
 
 @media (max-width: 720px) {
@@ -441,7 +585,21 @@ body {
   .control-grid.two-column,
   .control-grid.compact,
   .hover-metrics,
-  .hover-row {
+  .hover-row,
+  .search-laser-metric-row {
     grid-template-columns: 1fr;
+  }
+
+  .search-laser-card-header,
+  .search-plan-summary {
+    align-items: flex-start;
+  }
+
+  .search-laser-coverage {
+    justify-content: flex-start;
+  }
+
+  .search-laser-metric-meta {
+    justify-self: start;
   }
 }
