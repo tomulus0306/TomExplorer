@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 from datetime import datetime
+import io
 import os
 from pathlib import Path
 import threading
@@ -476,6 +478,104 @@ def preserve_manual_ranges(
         if current_log_y == target_log_y and current_y_mode == target_y_mode:
             return x_range, y_range
     return x_range, None
+
+
+def current_manual_x_range(
+    figure_state: dict[str, Any] | None,
+    relayout_data: dict[str, Any] | None,
+    target_x_unit: str,
+    target_render_revision: int | None,
+) -> list[float] | None:
+    layout = ((figure_state or {}).get("layout", {}) or {})
+    meta = (layout.get("meta", {}) or {}) if isinstance(layout, dict) else {}
+    current_render_revision = meta.get("render_revision")
+    current_x_unit = meta.get("x_unit", "um")
+    if current_render_revision != target_render_revision or current_x_unit != target_x_unit:
+        return None
+
+    x_range = extract_axis_range(relayout_data, "xaxis")
+    if x_range is not None:
+        return x_range
+
+    current_x_range = ((layout.get("xaxis", {}) or {}).get("range"))
+    if isinstance(current_x_range, (list, tuple)) and len(current_x_range) == 2:
+        return [float(current_x_range[0]), float(current_x_range[1])]
+    return None
+
+
+def build_manual_export_csv(
+    serialized_result: dict[str, Any],
+    x_unit: str,
+    x_range: list[float] | None,
+) -> str:
+    result = deserialize_manual_result(serialized_result)
+    x_values = spectrum_x_values(result, x_unit)
+    visible_mask = visible_slice_mask(x_values, x_range)
+
+    visible_wavelength_um = result.wavelength_um[visible_mask]
+    visible_wavenumber_cm1 = result.wavenumber_cm1[visible_mask]
+    visible_total_sigma = result.total_sigma_cm2_per_molecule[visible_mask]
+    visible_total_alpha = result.total_alpha_per_cm[visible_mask]
+    visible_components = {
+        gas: {
+            "sigma": component.sigma_cm2_per_molecule[visible_mask],
+            "alpha": component.alpha_per_cm[visible_mask],
+            "concentration": component.concentration,
+        }
+        for gas, component in sorted(result.components.items())
+    }
+
+    x_lower = float(np.min(x_values[visible_mask]))
+    x_upper = float(np.max(x_values[visible_mask]))
+    analyte_summary = "; ".join(
+        f"{gas}={format_concentration(component['concentration'])}"
+        for gas, component in visible_components.items()
+    )
+
+    buffer = io.StringIO()
+    buffer.write("# TomExplorer CSV Export\n")
+    buffer.write(f"# Exportzeit: {datetime.now().isoformat(timespec='seconds')}\n")
+    buffer.write(f"# Analyte und Konzentrationen: {analyte_summary or '-'}\n")
+    buffer.write(f"# T [degC]: {result.temperature_c:.6g}\n")
+    buffer.write(f"# p [hPa]: {result.pressure_hpa:.6g}\n")
+    buffer.write(f"# Schrittweite [cm-1]: {result.step_cm1:.6g}\n")
+    buffer.write(f"# Sichtbarer Bereich Wellenlaenge [um]: {float(np.min(visible_wavelength_um)):.10g} bis {float(np.max(visible_wavelength_um)):.10g}\n")
+    buffer.write(f"# Sichtbarer Bereich Wellenzahl [cm-1]: {float(np.min(visible_wavenumber_cm1)):.10g} bis {float(np.max(visible_wavenumber_cm1)):.10g}\n")
+    buffer.write(
+        f"# Sichtbarer Bereich aktuelle x-Achse [{('um' if x_unit == 'um' else 'cm-1')}]: {x_lower:.10g} bis {x_upper:.10g}\n"
+    )
+
+    writer = csv.writer(buffer, lineterminator="\n")
+    columns = [
+        "wavelength_um",
+        "wavenumber_cm-1",
+        "total_sigma_cm2_per_molecule",
+        "total_alpha_per_cm",
+    ]
+    for gas in visible_components:
+        columns.append(f"{gas}_sigma_cm2_per_molecule")
+        columns.append(f"{gas}_alpha_per_cm")
+    writer.writerow(columns)
+
+    for index in range(len(visible_wavelength_um)):
+        row: list[float] = [
+            float(visible_wavelength_um[index]),
+            float(visible_wavenumber_cm1[index]),
+            float(visible_total_sigma[index]),
+            float(visible_total_alpha[index]),
+        ]
+        for gas in visible_components:
+            row.append(float(visible_components[gas]["sigma"][index]))
+            row.append(float(visible_components[gas]["alpha"][index]))
+        writer.writerow(row)
+    return buffer.getvalue()
+
+
+def manual_export_filename(serialized_result: dict[str, Any]) -> str:
+    result = deserialize_manual_result(serialized_result)
+    gas_label = "-".join(sorted(result.components.keys())[:4]) or "spectrum"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"tomexplorer_manual_{gas_label}_{timestamp}.csv"
 
 
 def auto_linear_y_range(values: np.ndarray) -> list[float]:
@@ -1336,6 +1436,7 @@ app.layout = html.Div(
                                                                 html.Div("Bitte warten...", id="manual-fetch-search-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
                                                             ],
                                                         ),
+                                                        html.Button("CSV exportieren", id="manual-export", className="secondary-button"),
                                                     ],
                                                 ),
                                                 html.P(
@@ -1365,6 +1466,7 @@ app.layout = html.Div(
                                         html.Div(id="manual-hover-panel", children=hover_panel(None)),
                                         dcc.Store(id="manual-spectrum-store"),
                                         dcc.Store(id="manual-range-unit-store", data="um"),
+                                        dcc.Download(id="manual-export-download"),
                                         dcc.ConfirmDialog(id="hitran-update-dialog"),
                                         dcc.Interval(id="startup-hitran-check", interval=400, n_intervals=0, max_intervals=1),
                                     ],
@@ -1829,6 +1931,35 @@ def render_manual_spectrum(
         x_range=x_range,
         y_range=y_range,
     )
+
+
+@app.callback(
+    Output("manual-export-download", "data"),
+    Input("manual-export", "n_clicks"),
+    State("manual-spectrum-store", "data"),
+    State("manual-range-unit", "value"),
+    State("manual-graph", "relayoutData"),
+    State("manual-graph", "figure"),
+    prevent_initial_call=True,
+)
+def export_manual_spectrum_csv(
+    _n_clicks: int,
+    serialized_result: dict[str, Any] | None,
+    range_unit: str,
+    relayout_data: dict[str, Any] | None,
+    current_figure: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not _n_clicks or not serialized_result:
+        raise PreventUpdate
+
+    x_range = current_manual_x_range(
+        current_figure,
+        relayout_data,
+        range_unit,
+        serialized_result.get("render_revision"),
+    )
+    csv_content = build_manual_export_csv(serialized_result, range_unit, x_range)
+    return dcc.send_string(csv_content, manual_export_filename(serialized_result))
 
 
 @app.callback(
