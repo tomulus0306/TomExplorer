@@ -444,6 +444,8 @@ def concentration_row(prefix: str, gas: str, value: float, unit: str, visible: b
                         type="number",
                         value=value,
                         debounce=True,
+                        persistence=True,
+                        persistence_type="local",
                         className="number-input",
                     ),
                     dcc.Dropdown(
@@ -451,6 +453,8 @@ def concentration_row(prefix: str, gas: str, value: float, unit: str, visible: b
                         options=UNIT_OPTIONS,
                         value=unit,
                         clearable=False,
+                        persistence=True,
+                        persistence_type="local",
                         className="mini-dropdown",
                     ),
                 ],
@@ -854,22 +858,6 @@ def make_spectrum_figure(
     layout_meta = {"render_revision": render_revision, "y_mode": y_mode, "x_unit": x_unit, "revision_key": revision_key} if preserve_ui_state else {"x_unit": x_unit, "revision_key": revision_key}
     figure = go.Figure()
 
-    gap_marker_specs: list[tuple[str, list[tuple[float, float]]]] = []
-    for gas, intervals in sorted(result.missing_ranges_cm1_by_gas.items()):
-        if gas not in visible_set:
-            continue
-        if not intervals:
-            continue
-        plotted_intervals: list[tuple[float, float]] = []
-        for start_cm1, end_cm1 in intervals:
-            if x_unit == "um":
-                start_x, end_x = normalize_wavelength_window("cm-1", start_cm1, end_cm1)
-            else:
-                start_x, end_x = float(start_cm1), float(end_cm1)
-            plotted_intervals.append((float(start_x), float(end_x)))
-        if plotted_intervals:
-            gap_marker_specs.append((gas, plotted_intervals))
-
     for gas, component in selected_components:
         y_values = component.alpha_per_cm if y_mode == "alpha" else component.sigma_cm2_per_molecule
         if log_y:
@@ -962,49 +950,6 @@ def make_spectrum_figure(
                 annotation_position="top",
                 annotation_font={"color": str(line["color"]), "size": 11},
             )
-
-    if gap_marker_specs:
-        marker_top = 0.985
-        marker_step = 0.06
-        for level, (gas, intervals) in enumerate(gap_marker_specs):
-            y_top = marker_top - (level * marker_step)
-            y_bottom = max(0.90, y_top - 0.018)
-            color = str(GAS_LIBRARY[gas].get("plot_color", GAS_LIBRARY[gas]["color"]))
-            first_interval = True
-            for start_x, end_x in intervals:
-                x_left = min(start_x, end_x)
-                x_right = max(start_x, end_x)
-                figure.add_shape(
-                    type="rect",
-                    x0=x_left,
-                    x1=x_right,
-                    y0=y_bottom,
-                    y1=y_top,
-                    xref="x",
-                    yref="paper",
-                    line={"color": color, "width": 1},
-                    fillcolor=color,
-                    opacity=0.18,
-                )
-                if first_interval:
-                    x_anchor = x_left + (x_right - x_left) * 0.5
-                    if x_unit == "um":
-                        interval_text = f"{x_left:.3f}-{x_right:.3f} µm"
-                    else:
-                        interval_text = f"{x_left:.1f}-{x_right:.1f} cm⁻¹"
-                    figure.add_annotation(
-                        x=x_anchor,
-                        y=y_top + 0.002,
-                        xref="x",
-                        yref="paper",
-                        text=f"{display_formula_plot(gas)}: keine Daten ({interval_text})",
-                        showarrow=False,
-                        xanchor="center",
-                        yanchor="bottom",
-                        font={"family": BODY_FONT, "size": 11, "color": color},
-                        bgcolor="rgba(255,250,242,0.82)",
-                    )
-                    first_interval = False
 
     figure.update_layout(
         template="plotly_white",
@@ -1559,6 +1504,8 @@ app.layout = html.Div(
                                                             options=gas_options(),
                                                             value=DEFAULT_MANUAL_GASES,
                                                             multi=True,
+                                                            persistence=True,
+                                                            persistence_type="local",
                                                             className="main-dropdown",
                                                         ),
                                                         html.Div(
@@ -1749,6 +1696,8 @@ app.layout = html.Div(
                                                             options=gas_options(),
                                                             value=DEFAULT_TARGET_GASES,
                                                             multi=True,
+                                                            persistence=True,
+                                                            persistence_type="local",
                                                             className="main-dropdown",
                                                         ),
                                                         html.Div(
@@ -1775,6 +1724,8 @@ app.layout = html.Div(
                                                             options=gas_options(),
                                                             value=DEFAULT_INTERFERENCE_GASES,
                                                             multi=True,
+                                                            persistence=True,
+                                                            persistence_type="local",
                                                             className="main-dropdown",
                                                         ),
                                                         html.Div(

@@ -70,6 +70,39 @@
     return [];
   }
 
+  function normalizeRangeList(ranges) {
+    if (!Array.isArray(ranges)) {
+      return [];
+    }
+    return ranges
+      .map((interval) => {
+        if (!Array.isArray(interval) || interval.length < 2) {
+          return null;
+        }
+        const start = Number(interval[0]);
+        const end = Number(interval[1]);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) {
+          return null;
+        }
+        return [Math.min(start, end), Math.max(start, end)];
+      })
+      .filter(Boolean);
+  }
+
+  function missingDataInfoAtWavenumber(serializedResult, gas, wavenumberCm1) {
+    const missingMap = (serializedResult && serializedResult.missing_ranges_cm1_by_gas) || {};
+    const ranges = normalizeRangeList(missingMap[gas]);
+    for (const range of ranges) {
+      if (wavenumberCm1 >= range[0] && wavenumberCm1 <= range[1]) {
+        return {
+          missing: true,
+          rangeText: `${range[0].toFixed(2)}-${range[1].toFixed(2)} cm⁻¹`,
+        };
+      }
+    }
+    return { missing: false, rangeText: "" };
+  }
+
   function hoverDataFromPlot(graph) {
     if (!graph || !Array.isArray(graph._hoverdata) || graph._hoverdata.length === 0) {
       return null;
@@ -214,30 +247,43 @@
       const sigma = Number(component.sigma_cm2_per_molecule[sampleIndex]);
       const alpha = Number(component.alpha_per_cm[sampleIndex]);
       const concentration = Number(component.concentration);
+      const wavenumberCm1 = Number(serializedResult.wavenumber_cm1[sampleIndex]);
+      const missingDataInfo = missingDataInfoAtWavenumber(serializedResult, gas, wavenumberCm1);
       return {
         gas,
         component,
         sigma,
         alpha,
         concentration,
+        missingDataInfo,
       };
+    }).filter((entry) => Number.isFinite(entry.sigma) && entry.sigma !== 0);
+
+    entries.sort((left, right) => right.alpha - left.alpha);
+
+    const rows = entries.map((entry) => {
+      const valueCells = entry.missingDataInfo.missing
+        ? [
+            html("Span", { children: "Daten nicht vorhanden" }),
+            html("Span", { children: `Luecke: ${entry.missingDataInfo.rangeText}` }),
+          ]
+        : [
+            html("Span", { children: `σ [cm²/Molekül] ${entry.sigma.toExponential(3)}` }),
+            html("Span", { children: `α [1/cm] ${entry.alpha.toExponential(3)}` }),
+          ];
+      return html("Div", {
+        className: "hover-row",
+        children: [
+          html("Span", {
+            className: "hover-gas",
+            style: { color: entry.component.color || "#1f2937" },
+            children: displayFormula(entry.gas),
+          }),
+          ...valueCells,
+          html("Span", { children: formatConcentration(entry.concentration) }),
+        ],
+      });
     });
-
-    entries.sort((left, right) => Math.abs(right.alpha) - Math.abs(left.alpha));
-
-    const rows = entries.map((entry) => html("Div", {
-      className: "hover-row",
-      children: [
-        html("Span", {
-          className: "hover-gas",
-          style: { color: entry.component.color || "#1f2937" },
-          children: displayFormula(entry.gas),
-        }),
-        html("Span", { children: `σ [cm²/Molekül] ${entry.sigma.toExponential(3)}` }),
-        html("Span", { children: `α [1/cm] ${entry.alpha.toExponential(3)}` }),
-        html("Span", { children: formatConcentration(entry.concentration) }),
-      ],
-    }));
 
     return html("Div", {
       className: "hover-card",
