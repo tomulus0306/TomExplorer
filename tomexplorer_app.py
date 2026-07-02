@@ -90,6 +90,12 @@ MANUAL_CONCENTRATION_STATES = [
     State(f"manual-concentration-unit-{gas}", "value") for gas in ALL_GASES
 ]
 
+MANUAL_CONCENTRATION_INPUTS = [
+    Input(f"manual-concentration-value-{gas}", "value") for gas in ALL_GASES
+] + [
+    Input(f"manual-concentration-unit-{gas}", "value") for gas in ALL_GASES
+]
+
 TARGET_CONCENTRATION_STATES = [
     State(f"search-target-concentration-value-{gas}", "value") for gas in ALL_GASES
 ] + [
@@ -134,6 +140,29 @@ def display_formula(gas: str) -> str:
     return gas.translate(SUBSCRIPT_DIGITS)
 
 
+def display_formula_plot(gas: str) -> str:
+    # Plotly annotation text is easier to read with plain ASCII formulas.
+    return gas
+
+
+def component_visibility_options(serialized_result: dict[str, Any] | None) -> list[dict[str, str]]:
+    if not serialized_result:
+        return []
+    components = serialized_result.get("components", {})
+    gases = sorted(components.keys())
+    return [{"label": display_formula(gas), "value": gas} for gas in gases]
+
+
+def normalized_visible_gases(options: list[dict[str, str]], selected: list[str] | None) -> list[str]:
+    option_values = [entry["value"] for entry in options]
+    if not option_values:
+        return []
+    if not selected:
+        return option_values
+    filtered = [gas for gas in selected if gas in option_values]
+    return filtered or option_values
+
+
 def normalize_wavelength_window(range_unit: str, range_min: float, range_max: float) -> tuple[float, float]:
     if range_unit == "um":
         return float(min(range_min, range_max)), float(max(range_min, range_max))
@@ -142,6 +171,98 @@ def normalize_wavelength_window(range_unit: str, range_min: float, range_max: fl
     wavelength_min_um = float(wavenumber_cm1_to_wavelength_um(nu_max))
     wavelength_max_um = float(wavenumber_cm1_to_wavelength_um(nu_min))
     return min(wavelength_min_um, wavelength_max_um), max(wavelength_min_um, wavelength_max_um)
+
+
+def format_coverage_interval(interval_cm1: tuple[float, float], range_unit: str) -> str:
+    start_cm1, end_cm1 = float(interval_cm1[0]), float(interval_cm1[1])
+    if range_unit == "um":
+        start_um, end_um = normalize_wavelength_window("cm-1", start_cm1, end_cm1)
+        return f"{start_um:.3f}-{end_um:.3f} µm"
+    return f"{start_cm1:.2f}-{end_cm1:.2f} cm⁻¹"
+
+
+def coverage_gap_notice(
+    result: ManualSpectrumResult,
+    gases: list[str] | tuple[str, ...] | None,
+    range_unit: str,
+    intro: str,
+) -> str:
+    gap_map = result.missing_ranges_cm1_by_gas or {}
+    notes: list[str] = []
+    for gas in gases or []:
+        intervals = tuple(gap_map.get(gas, tuple()))
+        if not intervals:
+            continue
+        labels = [format_coverage_interval(interval, range_unit) for interval in intervals[:4]]
+        if len(intervals) > 4:
+            labels.append(f"+{len(intervals) - 4} weitere")
+        notes.append(f"{display_formula(gas)}: {', '.join(labels)}")
+    if not notes:
+        return ""
+    return f" {intro} " + " | ".join(notes) + "."
+
+
+def _source_detail_text(gas: str, details: dict[str, Any], range_unit: str) -> str:
+    source_kind = str(details.get("source", ""))
+    ranges_cm1 = details.get("coverage_ranges_cm1", [])
+    ranges = [tuple(interval[:2]) for interval in ranges_cm1 if isinstance(interval, list) and len(interval) >= 2]
+    coverage_text = ", ".join(format_coverage_interval(interval, range_unit) for interval in ranges[:3]) if ranges else "-"
+
+    if source_kind == "xsc":
+        temp_k = details.get("temperature_k")
+        pressure_torr = details.get("pressure_torr")
+        files = details.get("files", [])
+        extra_bits: list[str] = []
+        if isinstance(temp_k, (int, float)):
+            extra_bits.append(f"T={float(temp_k):.1f} K")
+        if isinstance(pressure_torr, (int, float)):
+            extra_bits.append(f"p={float(pressure_torr):.1f} Torr")
+        if isinstance(files, list) and files:
+            extra_bits.append(f"Dateien={len(files)}")
+        extra_text = " | " + " | ".join(extra_bits) if extra_bits else ""
+        return f"{display_formula_plot(gas)}: XSC{extra_text} | Coverage {coverage_text}"
+
+    if source_kind == "line_cache":
+        return f"{display_formula_plot(gas)}: Liniencache | Coverage {coverage_text}"
+
+    if source_kind == "offline_db":
+        temp_c = details.get("reference_temperature_c")
+        pressure_hpa = details.get("reference_pressure_hpa")
+        extra_bits = []
+        if isinstance(temp_c, (int, float)):
+            extra_bits.append(f"T={float(temp_c):.1f} °C")
+        if isinstance(pressure_hpa, (int, float)):
+            extra_bits.append(f"p={float(pressure_hpa):.2f} hPa")
+        extra_text = " | " + " | ".join(extra_bits) if extra_bits else ""
+        return f"{display_formula_plot(gas)}: Offline-DB{extra_text} | Coverage {coverage_text}"
+
+    return f"{display_formula_plot(gas)}: keine Quelle im aktuellen Bereich"
+
+
+def source_details_panel(
+    serialized_result: dict[str, Any] | None,
+    visible_gases: list[str] | None,
+    range_unit: str,
+) -> html.Div:
+    if not serialized_result:
+        return html.Div(className="source-info-panel", children=[])
+
+    source_details = serialized_result.get("source_details_by_gas", {})
+    components = serialized_result.get("components", {})
+    visible_set = set(visible_gases or components.keys())
+    gases = [gas for gas in sorted(components.keys()) if gas in visible_set]
+    rows: list[Any] = []
+    for gas in gases:
+        details = source_details.get(gas, {"source": "unavailable"})
+        rows.append(html.Div(_source_detail_text(gas, details, range_unit), className="source-info-row"))
+
+    return html.Div(
+        className="source-info-panel",
+        children=[
+            html.H4("Datenquelle je Spezies", className="hover-title"),
+            html.Div(rows, className="source-info-list"),
+        ],
+    )
 
 
 def latest_hitran_cache_age_days() -> float | None:
@@ -242,6 +363,23 @@ def format_data_source_error(
 
     if "Offline spectra are missing for:" in message:
         missing = message.split("Offline spectra are missing for:", 1)[1].split(".", 1)[0].strip()
+        if "Local HITRAN cache is also missing for:" in message:
+            local_missing = message.split("Local HITRAN cache is also missing for:", 1)[1].split(".", 1)[0].strip()
+            return (
+                f"Die schnelle Offline-DB enthaelt noch keine vorgerechneten Spektren fuer: {missing}. "
+                f"Im lokalen HITRAN-Cache fehlen fuer diese Gase aktuell auch die Quelldaten: {local_missing}. "
+                "Der letzte manuelle Refresh hat fuer diesen Bereich sehr wahrscheinlich keine HITRAN-Liniendaten geliefert. "
+                "Bitte Bereich oder Gaswahl anpassen oder den Offline-Modus ausschalten."
+            )
+
+        if "Local HITRAN cache coverage is too small for:" in message:
+            local_ranges = message.split("Local HITRAN cache coverage is too small for:", 1)[1].split(".", 1)[0].strip()
+            return (
+                f"Die schnelle Offline-DB enthaelt noch keine vorgerechneten Spektren fuer: {missing}. "
+                f"Die lokalen HITRAN-Tabellen decken den angeforderten Bereich fuer diese Gase noch nicht vollstaendig ab: {local_ranges}. "
+                "Bitte den lokalen HITRAN-Cache fuer denselben Bereich erneut aktualisieren oder den Offline-Modus ausschalten."
+            )
+
         return (
             f"Die schnelle Offline-DB enthaelt noch keine vorgerechneten Spektren fuer: {missing}. "
             "Im Offline-Modus wird nicht automatisch live nachgeladen. Bitte den lokalen HITRAN-Cache fuer diese Komponenten aktualisieren oder den Offline-Modus ausschalten."
@@ -680,17 +818,28 @@ def make_spectrum_figure(
     log_level: int = 5,
     revision_key: str | None = None,
     preserve_ui_state: bool = True,
+    visible_gases: list[str] | None = None,
 ) -> go.Figure:
     result = deserialize_manual_result(serialized_result)
+    visible_set = {
+        gas
+        for gas in (visible_gases or list(result.components.keys()))
+        if gas in result.components
+    }
+    if not visible_set:
+        visible_set = set(result.components.keys())
+    selected_components = [
+        (gas, component)
+        for gas, component in result.components.items()
+        if gas in visible_set
+    ]
     render_revision = serialized_result.get("render_revision")
     x_values = spectrum_x_values(result, x_unit)
     secondary_title, secondary_ticks, secondary_labels = secondary_axis_config(x_unit, x_values)
     customdata = np.column_stack((result.wavelength_um * 1000.0, result.wavenumber_cm1))
-    total_y = (
-        result.total_alpha_per_cm
-        if y_mode == "alpha"
-        else result.total_sigma_cm2_per_molecule
-    )
+    total_y = np.zeros_like(result.wavenumber_cm1, dtype=float)
+    for _gas, component in selected_components:
+        total_y += component.alpha_per_cm if y_mode == "alpha" else component.sigma_cm2_per_molecule
     y_title = "Alpha [1/cm]" if y_mode == "alpha" else "Sigma [cm²/Molekül]"
     positive_total = total_y[total_y > 0]
     log_floor_value = 1.0e-35
@@ -705,7 +854,23 @@ def make_spectrum_figure(
     layout_meta = {"render_revision": render_revision, "y_mode": y_mode, "x_unit": x_unit, "revision_key": revision_key} if preserve_ui_state else {"x_unit": x_unit, "revision_key": revision_key}
     figure = go.Figure()
 
-    for gas, component in result.components.items():
+    gap_marker_specs: list[tuple[str, list[tuple[float, float]]]] = []
+    for gas, intervals in sorted(result.missing_ranges_cm1_by_gas.items()):
+        if gas not in visible_set:
+            continue
+        if not intervals:
+            continue
+        plotted_intervals: list[tuple[float, float]] = []
+        for start_cm1, end_cm1 in intervals:
+            if x_unit == "um":
+                start_x, end_x = normalize_wavelength_window("cm-1", start_cm1, end_cm1)
+            else:
+                start_x, end_x = float(start_cm1), float(end_cm1)
+            plotted_intervals.append((float(start_x), float(end_x)))
+        if plotted_intervals:
+            gap_marker_specs.append((gas, plotted_intervals))
+
+    for gas, component in selected_components:
         y_values = component.alpha_per_cm if y_mode == "alpha" else component.sigma_cm2_per_molecule
         if log_y:
             y_values = y_values.clip(min=log_floor_value)
@@ -784,6 +949,9 @@ def make_spectrum_figure(
 
     if highlighted_lines:
         for line in highlighted_lines:
+            line_gas = str(line.get("gas", ""))
+            if line_gas and line_gas not in visible_set:
+                continue
             figure.add_vline(
                 x=float(line["x_value"]),
                 line_width=1.8,
@@ -794,6 +962,49 @@ def make_spectrum_figure(
                 annotation_position="top",
                 annotation_font={"color": str(line["color"]), "size": 11},
             )
+
+    if gap_marker_specs:
+        marker_top = 0.985
+        marker_step = 0.06
+        for level, (gas, intervals) in enumerate(gap_marker_specs):
+            y_top = marker_top - (level * marker_step)
+            y_bottom = max(0.90, y_top - 0.018)
+            color = str(GAS_LIBRARY[gas].get("plot_color", GAS_LIBRARY[gas]["color"]))
+            first_interval = True
+            for start_x, end_x in intervals:
+                x_left = min(start_x, end_x)
+                x_right = max(start_x, end_x)
+                figure.add_shape(
+                    type="rect",
+                    x0=x_left,
+                    x1=x_right,
+                    y0=y_bottom,
+                    y1=y_top,
+                    xref="x",
+                    yref="paper",
+                    line={"color": color, "width": 1},
+                    fillcolor=color,
+                    opacity=0.18,
+                )
+                if first_interval:
+                    x_anchor = x_left + (x_right - x_left) * 0.5
+                    if x_unit == "um":
+                        interval_text = f"{x_left:.3f}-{x_right:.3f} µm"
+                    else:
+                        interval_text = f"{x_left:.1f}-{x_right:.1f} cm⁻¹"
+                    figure.add_annotation(
+                        x=x_anchor,
+                        y=y_top + 0.002,
+                        xref="x",
+                        yref="paper",
+                        text=f"{display_formula_plot(gas)}: keine Daten ({interval_text})",
+                        showarrow=False,
+                        xanchor="center",
+                        yanchor="bottom",
+                        font={"family": BODY_FONT, "size": 11, "color": color},
+                        bgcolor="rgba(255,250,242,0.82)",
+                    )
+                    first_interval = False
 
     figure.update_layout(
         template="plotly_white",
@@ -1024,9 +1235,20 @@ def search_plot_y_range(
     x_values: np.ndarray,
     x_range: list[float],
     log_y: bool,
+    visible_gases: list[str] | None = None,
 ) -> list[float] | None:
     mask = (x_values >= min(x_range)) & (x_values <= max(x_range))
-    local_alpha = result.total_alpha_per_cm[mask]
+    visible_set = {
+        gas
+        for gas in (visible_gases or list(result.components.keys()))
+        if gas in result.components
+    }
+    if not visible_set:
+        visible_set = set(result.components.keys())
+    total_visible_alpha = np.zeros_like(result.total_alpha_per_cm, dtype=float)
+    for gas in visible_set:
+        total_visible_alpha += result.components[gas].alpha_per_cm
+    local_alpha = total_visible_alpha[mask]
     if not local_alpha.size or log_y:
         return None
     local_max = float(np.max(local_alpha))
@@ -1044,7 +1266,9 @@ def build_search_window_plots(
     log_level: int,
     result: ManualSpectrumResult,
     fine_step_cm1: float,
+    visible_gases: list[str] | None = None,
 ) -> html.Div:
+    serialized_result = serialize_manual_result(result)
     x_values = spectrum_x_values(result, range_unit)
     plot_cards: list[html.Div] = []
 
@@ -1055,6 +1279,7 @@ def build_search_window_plots(
         }
         highlighted_lines = [
             {
+                "gas": gas,
                 "x_value": float(metric.peak_wavenumber_cm1) if range_unit == "cm-1" else metric.peak_wavelength_um,
                 "color": result.components[gas].color,
                 "label": display_formula(gas),
@@ -1067,14 +1292,14 @@ def build_search_window_plots(
             min(window_highlight["x_min"], window_highlight["x_max"]),
             max(window_highlight["x_min"], window_highlight["x_max"]),
         )
-        y_range = search_plot_y_range(result, x_values, x_range, log_y)
+        y_range = search_plot_y_range(result, x_values, x_range, log_y, visible_gases)
         title = (
             f"Laser {index} | {', '.join(display_formula(gas) for gas in window.coverage)}"
             if window.coverage
             else f"Laser {index}"
         )
         figure = make_spectrum_figure(
-            store["spectrum"],
+            serialized_result,
             y_mode="alpha",
             log_y=log_y,
             log_level=int(log_level),
@@ -1086,6 +1311,7 @@ def build_search_window_plots(
             y_range=y_range,
             revision_key=f"search-window:{plan.rank}:{window.window_id}:{range_unit}",
             preserve_ui_state=False,
+            visible_gases=visible_gases,
         )
         figure.update_layout(height=360, meta={**(figure.layout.meta or {}), "step_cm1": fine_step_cm1})
         plot_cards.append(
@@ -1302,6 +1528,26 @@ app.layout = html.Div(
                                     className="sidebar",
                                     children=[
                                         html.Div(
+                                            className="manual-primary-actions",
+                                            children=[
+                                                html.Div(
+                                                    className="button-lock-wrap",
+                                                    children=[
+                                                        html.Button("Spektrum berechnen", id="manual-run", className="action-button"),
+                                                        html.Div("Bitte warten...", id="manual-run-fetch-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
+                                                    ],
+                                                ),
+                                                dcc.Checklist(
+                                                    id="manual-auto-update",
+                                                    options=[{"label": "Auto-Update", "value": "auto"}],
+                                                    value=["auto"],
+                                                    inline=True,
+                                                    className="manual-auto-update-toggle",
+                                                ),
+                                                html.Div(id="manual-status", className="status-box"),
+                                            ],
+                                        ),
+                                        html.Div(
                                             className="sidebar-scroll",
                                             children=[
                                                 controls_section(
@@ -1405,6 +1651,12 @@ app.layout = html.Div(
                                                                         ),
                                                                     ],
                                                                 ),
+                                                                dcc.Checklist(
+                                                                    id="manual-visible-gases",
+                                                                    options=[],
+                                                                    value=[],
+                                                                    className="component-visibility-checklist",
+                                                                ),
                                                             ],
                                                         ),
                                                         html.P(
@@ -1424,13 +1676,6 @@ app.layout = html.Div(
                                                         html.Div(
                                                             className="button-lock-wrap",
                                                             children=[
-                                                                html.Button("Spektrum berechnen", id="manual-run", className="action-button"),
-                                                                html.Div("Bitte warten...", id="manual-run-fetch-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
-                                                            ],
-                                                        ),
-                                                        html.Div(
-                                                            className="button-lock-wrap",
-                                                            children=[
                                                                 html.Button("Lokalen HITRAN-Cache aktualisieren", id="manual-fetch", className="secondary-button"),
                                                                 html.Div("Bitte warten...", id="manual-fetch-manual-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
                                                                 html.Div("Bitte warten...", id="manual-fetch-search-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
@@ -1443,7 +1688,6 @@ app.layout = html.Div(
                                                     "Waehrend der HITRAN-Aktualisierung bitte keine neuen Berechnungen starten. Die ausgewaehlten Gase und die schnelle Offline-DB werden in dieser Zeit neu aufgebaut.",
                                                     className="section-copy small",
                                                 ),
-                                                html.Div(id="manual-status", className="status-box"),
                                                 html.Div(id="manual-fetch-status", className="status-box"),
                                             ],
                                         ),
@@ -1452,18 +1696,24 @@ app.layout = html.Div(
                                 html.Div(
                                     className="content",
                                     children=[
-                                        dcc.Loading(
-                                            type="circle",
+                                        html.Div(
+                                            className="manual-main-row",
                                             children=[
-                                                dcc.Graph(
-                                                    id="manual-graph",
-                                                    figure=empty_figure("Spektrum wird nach der ersten Berechnung hier angezeigt."),
-                                                    className="main-graph",
-                                                    clear_on_unhover=False,
+                                                dcc.Loading(
+                                                    type="circle",
+                                                    children=[
+                                                        dcc.Graph(
+                                                            id="manual-graph",
+                                                            figure=empty_figure("Spektrum wird nach der ersten Berechnung hier angezeigt."),
+                                                            className="main-graph",
+                                                            clear_on_unhover=False,
+                                                        ),
+                                                    ],
                                                 ),
+                                                html.Div(id="manual-hover-panel", className="manual-hover-panel", children=hover_panel(None)),
                                             ],
                                         ),
-                                        html.Div(id="manual-hover-panel", children=hover_panel(None)),
+                                        html.Div(id="manual-source-info", children=source_details_panel(None, None, "um")),
                                         dcc.Store(id="manual-spectrum-store"),
                                         dcc.Store(id="manual-range-unit-store", data="um"),
                                         dcc.Download(id="manual-export-download"),
@@ -1673,6 +1923,12 @@ app.layout = html.Div(
                                                                         ),
                                                                     ],
                                                                 ),
+                                                                dcc.Checklist(
+                                                                    id="search-visible-gases",
+                                                                    options=[],
+                                                                    value=[],
+                                                                    className="component-visibility-checklist",
+                                                                ),
                                                             ],
                                                         ),
                                                         dcc.Graph(
@@ -1681,6 +1937,7 @@ app.layout = html.Div(
                                                             className="main-graph",
                                                             clear_on_unhover=False,
                                                         ),
+                                                        html.Div(id="search-source-info", children=source_details_panel(None, None, "um")),
                                                         html.Div(
                                                             id="search-window-figures",
                                                             children=empty_search_window_plots(),
@@ -1695,6 +1952,7 @@ app.layout = html.Div(
                                         ),
                                         html.Div(id="search-hover-panel", className="search-hover-panel", children=hover_panel(None)),
                                         dcc.Store(id="search-store"),
+                                        dcc.Store(id="search-selected-spectrum-store"),
                                         dcc.Store(id="search-range-unit-store", data="um"),
                                     ],
                                 ),
@@ -1822,23 +2080,26 @@ def sync_search_range_inputs(
     Output("manual-spectrum-store", "data"),
     Output("manual-status", "children"),
     Input("manual-run", "n_clicks"),
-    State("manual-gases", "value"),
-    State("manual-range-unit", "value"),
-    State("manual-range-min", "value"),
-    State("manual-range-max", "value"),
-    State("manual-step", "value"),
-    State("manual-temperature", "value"),
-    State("manual-pressure", "value"),
-    State("offline-mode", "value"),
-    *MANUAL_CONCENTRATION_STATES,
+    Input("manual-auto-update", "value"),
+    Input("manual-gases", "value"),
+    Input("manual-range-unit", "value"),
+    Input("manual-range-min", "value"),
+    Input("manual-range-max", "value"),
+    Input("manual-step", "value"),
+    Input("manual-temperature", "value"),
+    Input("manual-pressure", "value"),
+    Input("offline-mode", "value"),
+    *MANUAL_CONCENTRATION_INPUTS,
     running=[
         (Output("manual-run", "disabled"), True, False),
         (Output("manual-run", "children"), "Spektrum wird berechnet...", "Spektrum berechnen"),
         (Output("manual-fetch-manual-lock", "style"), BUTTON_LOCK_VISIBLE, BUTTON_LOCK_HIDDEN),
     ],
+    prevent_initial_call=True,
 )
 def update_manual_spectrum(
     _n_clicks: int,
+    auto_update_selection: list[str] | None,
     selected_gases: list[str],
     range_unit: str,
     range_min: float,
@@ -1849,14 +2110,19 @@ def update_manual_spectrum(
     offline_selection: list[str] | None,
     *concentration_state_values: Any,
 ) -> tuple[dict[str, Any] | None, str]:
-    if not _n_clicks:
+    data_source = OFFLINE_DB_MODE if offline_mode_enabled(offline_selection) else LIVE_DB_MODE
+    trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
+    if trigger_id is None and dash.callback_context.triggered:
+        trigger_id = str(dash.callback_context.triggered[0].get("prop_id", "")).split(".", 1)[0]
+    auto_update_enabled = "auto" in (auto_update_selection or [])
+    if not auto_update_enabled and trigger_id != "manual-run":
         raise PreventUpdate
-
     try:
+        if not selected_gases:
+            raise ValueError("Bitte mindestens ein Gas auswaehlen.")
         gas_values = list(concentration_state_values[: len(ALL_GASES)])
         gas_units = list(concentration_state_values[len(ALL_GASES) :])
         concentrations = collect_concentrations(gas_values, gas_units, selected_gases)
-        data_source = OFFLINE_DB_MODE if offline_mode_enabled(offline_selection) else LIVE_DB_MODE
         parsed_range_min = parse_required_number(range_min, "Minimum")
         parsed_range_max = parse_required_number(range_max, "Maximum")
         manual_result = build_manual_spectrum(
@@ -1886,17 +2152,34 @@ def update_manual_spectrum(
                 f"Wenn ein größerer Bereich langsam wird, ist für diese Spannweite etwa {suggested_step:.4f} cm⁻¹ sinnvoll. "
                 "Quelle: lokale HAPI/HITRAN-DB."
             )
+        status += coverage_gap_notice(manual_result, selected_gases, range_unit, "Fehlende Spektraldatenbereiche:")
         return serialized, status
     except Exception as exc:
         return None, format_data_source_error(exc, data_source, range_unit, range_min, range_max)
 
 
 @app.callback(
+    Output("manual-visible-gases", "options"),
+    Output("manual-visible-gases", "value"),
+    Input("manual-spectrum-store", "data"),
+    State("manual-visible-gases", "value"),
+)
+def sync_manual_visible_gases(
+    serialized_result: dict[str, Any] | None,
+    current_selection: list[str] | None,
+) -> tuple[list[dict[str, str]], list[str]]:
+    options = component_visibility_options(serialized_result)
+    return options, normalized_visible_gases(options, current_selection)
+
+
+@app.callback(
     Output("manual-graph", "figure"),
+    Output("manual-source-info", "children"),
     Input("manual-spectrum-store", "data"),
     Input("manual-y-mode", "value"),
     Input("manual-log-scale", "value"),
     Input("manual-log-level", "value"),
+    Input("manual-visible-gases", "value"),
     Input("manual-range-unit", "value"),
     Input("manual-graph", "relayoutData"),
     State("manual-graph", "figure"),
@@ -1906,12 +2189,13 @@ def render_manual_spectrum(
     y_mode: str,
     log_scale: list[str],
     log_level: int,
+    visible_gases: list[str] | None,
     range_unit: str,
     relayout_data: dict[str, Any] | None,
     current_figure: dict[str, Any] | None,
-) -> go.Figure:
+) -> tuple[go.Figure, html.Div]:
     if not serialized_result:
-        return empty_figure("Spektrum wird nach der ersten Berechnung hier angezeigt.")
+        return empty_figure("Spektrum wird nach der ersten Berechnung hier angezeigt."), source_details_panel(None, None, range_unit)
     log_y = "log" in (log_scale or [])
     x_range, y_range = preserve_manual_ranges(
         current_figure,
@@ -1921,7 +2205,7 @@ def render_manual_spectrum(
         range_unit,
         serialized_result.get("render_revision"),
     )
-    return make_spectrum_figure(
+    figure = make_spectrum_figure(
         serialized_result,
         y_mode=y_mode,
         log_y=log_y,
@@ -1930,7 +2214,9 @@ def render_manual_spectrum(
         x_unit=range_unit,
         x_range=x_range,
         y_range=y_range,
+        visible_gases=visible_gases,
     )
+    return figure, source_details_panel(serialized_result, visible_gases, range_unit)
 
 
 @app.callback(
@@ -2142,8 +2428,14 @@ def run_band_search(
             range_unit=range_unit,
             data_source=data_source,
         )
+        coverage_notice = coverage_gap_notice(
+            search_result,
+            selected_target_gases,
+            range_unit,
+            "Achtung: Für diese Zielgase fehlen im Suchbereich Daten in:",
+        )
         if not plans:
-            return [], store, "Keine geeigneten Laserfenster gefunden. Bereich vergrößern, weniger Zielgase pro Laser erzwingen oder Schrittweite vergrößern."
+            return [], store, "Keine geeigneten Laserfenster gefunden. Bereich vergrößern, weniger Zielgase pro Laser erzwingen oder Schrittweite vergrößern." + coverage_notice
         if len(visible_plans) < result_limit:
             status = (
                 f"{len(plans)} Vorschläge berechnet. Es wurden nur {len(visible_plans)} ausreichend unterschiedliche Treffer gefunden, obwohl {result_limit} angefordert wurden."
@@ -2156,9 +2448,25 @@ def run_band_search(
             status += (
                 f" Quelle: schnelle Offline-DB ({search_result.temperature_c:.1f} °C, {search_result.pressure_hpa:.2f} hPa, {search_result.step_cm1:.3f} cm⁻¹)."
             )
+        status += coverage_notice
         return [0], store, status
     except Exception as exc:
         return [], None, format_data_source_error(exc, data_source, range_unit, range_min_value, range_max_value)
+
+
+@app.callback(
+    Output("search-visible-gases", "options"),
+    Output("search-visible-gases", "value"),
+    Input("search-store", "data"),
+    State("search-visible-gases", "value"),
+)
+def sync_search_visible_gases(
+    store: dict[str, Any] | None,
+    current_selection: list[str] | None,
+) -> tuple[list[dict[str, str]], list[str]]:
+    serialized_result = store.get("spectrum") if store else None
+    options = component_visibility_options(serialized_result)
+    return options, normalized_visible_gases(options, current_selection)
 
 
 @app.callback(
@@ -2175,32 +2483,59 @@ def sync_search_results_table(range_unit: str, store: dict[str, Any] | None) -> 
 
 @app.callback(
     Output("search-graph", "figure"),
+    Output("search-source-info", "children"),
     Output("search-window-figures", "children"),
     Output("search-plan-details", "children"),
+    Output("search-selected-spectrum-store", "data"),
     Input("search-results-table", "selected_rows"),
     Input("search-range-unit", "value"),
     Input("search-log-scale", "value"),
     Input("search-log-level", "value"),
+    Input("search-visible-gases", "value"),
     State("search-store", "data"),
+    State("search-selected-spectrum-store", "data"),
 )
 def update_search_plot(
     selected_rows: list[int],
     range_unit: str,
     log_scale: list[str],
     log_level: int,
+    visible_gases: list[str] | None,
     store: dict[str, Any] | None,
-) -> tuple[go.Figure, html.Div, html.Div]:
+    selected_result_store: dict[str, Any] | None,
+) -> tuple[go.Figure, html.Div, html.Div, html.Div, dict[str, Any] | None]:
     if not store or not store.get("plans"):
         return (
             empty_figure("Bandensuche starten und eine Zeile auswählen, um das Spektrum zu prüfen."),
+            source_details_panel(None, None, range_unit),
             empty_search_window_plots(),
             empty_search_plan_details(),
+            None,
         )
     row_index = selected_rows[0] if selected_rows else 0
     if row_index >= len(store["plans"]):
         row_index = 0
     plan = deserialize_laser_plan(store["plans"][row_index])
-    result, fine_step_cm1 = rebuild_selected_search_result(store, plan)
+    cache_key = "|".join([str(row_index), range_unit, *[window.window_id for window in plan.windows]])
+    trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
+    if trigger_id is None and dash.callback_context.triggered:
+        trigger_id = str(dash.callback_context.triggered[0].get("prop_id", "")).split(".", 1)[0]
+    can_reuse_cached_result = (
+        trigger_id in {"search-log-scale", "search-log-level", "search-visible-gases"}
+        and selected_result_store is not None
+        and selected_result_store.get("cache_key") == cache_key
+        and selected_result_store.get("spectrum") is not None
+    )
+    if can_reuse_cached_result:
+        result = deserialize_manual_result(selected_result_store["spectrum"])
+        fine_step_cm1 = float(selected_result_store.get("fine_step_cm1", result.step_cm1))
+    else:
+        result, fine_step_cm1 = rebuild_selected_search_result(store, plan)
+    selected_store_payload = {
+        "cache_key": cache_key,
+        "fine_step_cm1": float(fine_step_cm1),
+        "spectrum": serialize_manual_result(result),
+    }
     x_unit = range_unit
     highlighted_windows = [
         {
@@ -2219,9 +2554,10 @@ def update_search_plot(
             seen_lines.add(line_key)
             highlighted_lines.append(
                 {
+                    "gas": gas,
                     "x_value": float(metric.peak_wavenumber_cm1) if x_unit == "cm-1" else metric.peak_wavelength_um,
                     "color": result.components[gas].color,
-                    "label": display_formula(gas),
+                    "label": display_formula_plot(gas),
                 }
             )
     zoom_min = min(min(window["x_min"], window["x_max"]) for window in highlighted_windows)
@@ -2229,7 +2565,7 @@ def update_search_plot(
     x_values = spectrum_x_values(result, x_unit)
     x_range = search_plot_x_range(x_values, x_unit, zoom_min, zoom_max)
     log_y = "log" in (log_scale or [])
-    y_range = search_plot_y_range(result, x_values, x_range, log_y)
+    y_range = search_plot_y_range(result, x_values, x_range, log_y, visible_gases)
     covered_label = ", ".join(plan.covered_targets[:4])
     if len(plan.covered_targets) > 4:
         covered_label += f" +{len(plan.covered_targets) - 4}"
@@ -2238,7 +2574,7 @@ def update_search_plot(
         [str(plan.rank), x_unit, *[window.window_id for window in plan.windows]]
     )
     figure = make_spectrum_figure(
-        store["spectrum"],
+        serialize_manual_result(result),
         y_mode="alpha",
         log_y=log_y,
         log_level=int(log_level),
@@ -2250,12 +2586,16 @@ def update_search_plot(
         y_range=y_range,
         revision_key=plan_revision_key,
         preserve_ui_state=False,
+        visible_gases=visible_gases,
     )
     figure.update_layout(meta={**(figure.layout.meta or {}), "step_cm1": fine_step_cm1})
+    serialized_result = selected_store_payload["spectrum"]
     return (
         figure,
-        build_search_window_plots(plan, store, range_unit, log_y, int(log_level), result, fine_step_cm1),
+        source_details_panel(serialized_result, visible_gases, range_unit),
+        build_search_window_plots(plan, store, range_unit, log_y, int(log_level), result, fine_step_cm1, visible_gases),
         build_search_plan_details(plan, store, range_unit),
+        selected_store_payload,
     )
 
 
@@ -2296,7 +2636,6 @@ def open_browser_on_startup() -> None:
                 return
         except OSError:
             pass
-
         webbrowser.open_new(url)
 
     threading.Thread(target=_open, daemon=True).start()

@@ -20,6 +20,7 @@ import hapi as hp
 
 PA_PER_ATM = 101325.0
 PA_PER_HPA = 100.0
+TORR_PER_HPA = 0.750061683
 BOLTZMANN = 1.380649e-23
 CM3_PER_M3 = 1_000_000.0
 DEFAULT_MANUAL_STEP_CM1 = 0.01
@@ -42,6 +43,7 @@ MAX_LOCAL_PEAKS_PER_WINDOW_GAS = 12
 BASE_DIR = Path(__file__).resolve().parent
 LEGACY_DATA_DIR = BASE_DIR / "data"
 DATA_DIR = BASE_DIR / "hitran_cache"
+XSC_CACHE_DIR = DATA_DIR / "xsc"
 OFFLINE_SPECTRA_PATH = BASE_DIR / "abscross_dict.pkl"
 OFFLINE_DB_MODE = "offline"
 LIVE_DB_MODE = "live"
@@ -147,6 +149,25 @@ HITRAN_MOLECULE_NAMES = {
     61: "Nitryl chloride",
 }
 
+XSC_GAS_ALIASES: dict[str, tuple[str, ...]] = {
+    "C2F6": ("CF3CF3",),
+    "CF3CF3": ("C2F6",),
+}
+
+
+def _gas_lookup_token(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "", str(value)).upper()
+
+
+def _gas_lookup_tokens(gas: str) -> set[str]:
+    base_token = _gas_lookup_token(gas)
+    tokens: set[str] = {base_token} if base_token else set()
+    for alias in XSC_GAS_ALIASES.get(base_token, tuple()):
+        alias_token = _gas_lookup_token(alias)
+        if alias_token:
+            tokens.add(alias_token)
+    return tokens
+
 
 def _safe_gas_key(label: str, molecule_id: int) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_")
@@ -157,11 +178,43 @@ def _safe_gas_key(label: str, molecule_id: int) -> str:
     return cleaned
 
 
-def _dropdown_label(formula: str, molecule_id: int) -> str:
+def _dropdown_label(formula: str, molecule_id: int | None) -> str:
+    if molecule_id is None:
+        return f"{formula} - lokale XSC"
     molecule_name = HITRAN_MOLECULE_NAMES.get(molecule_id)
     if not molecule_name:
         return formula
     return f"{formula} - {molecule_name}"
+
+
+def _discover_local_xsc_gases() -> tuple[str, ...]:
+    if not XSC_CACHE_DIR.exists():
+        return tuple()
+
+    discovered: set[str] = set()
+    for directory in sorted(path for path in XSC_CACHE_DIR.iterdir() if path.is_dir()):
+        name = directory.name.strip()
+        if not name:
+            continue
+        expected_tokens = _gas_lookup_tokens(name)
+        if not expected_tokens:
+            continue
+        has_matching_xsc = any(
+            _gas_lookup_token(path.stem.split("_", 1)[0]) in expected_tokens
+            for path in directory.rglob("*.xsc")
+        )
+        if has_matching_xsc:
+            discovered.add(name)
+
+    for path in sorted(XSC_CACHE_DIR.rglob("*.xsc")):
+        stem = path.stem.strip()
+        if not stem:
+            continue
+        gas = stem.split("_", 1)[0].strip()
+        if gas:
+            discovered.add(gas)
+
+    return tuple(sorted(discovered))
 
 
 def _component_color_map(gases: tuple[str, ...]) -> dict[str, str]:
@@ -200,6 +253,19 @@ def _build_gas_library() -> dict[str, dict[str, Any]]:
             "color": color,
         }
 
+    for gas in _discover_local_xsc_gases():
+        if gas in catalog:
+            continue
+        color = CATALOG_FALLBACK_COLORS[fallback_index % len(CATALOG_FALLBACK_COLORS)]
+        fallback_index += 1
+        catalog[gas] = {
+            "molecule_id": None,
+            "isotope_id": None,
+            "label": gas,
+            "dropdown_label": _dropdown_label(gas, None),
+            "color": color,
+        }
+
     plot_colors = _component_color_map(tuple(sorted(catalog.keys())))
     for gas, plot_color in plot_colors.items():
         catalog[gas]["plot_color"] = plot_color
@@ -210,6 +276,8 @@ def _build_gas_library() -> dict[str, dict[str, Any]]:
 GAS_LIBRARY: dict[str, dict[str, Any]] = _build_gas_library()
 
 _FETCHED_RANGES: dict[str, tuple[float, float]] = {}
+_DB_STARTED = False
+_DB_PATH: str | None = None
 
 
 @dataclass(frozen=True)
@@ -234,6 +302,25 @@ class ManualSpectrumResult:
     pressure_hpa: float
     step_cm1: float
     range_label: str
+    coverage_ranges_cm1_by_gas: dict[str, tuple[tuple[float, float], ...]]
+    missing_ranges_cm1_by_gas: dict[str, tuple[tuple[float, float], ...]]
+    source_details_by_gas: dict[str, dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class CrossSectionSegment:
+    gas: str
+    path: Path
+    nu_min: float
+    nu_max: float
+    temperature_k: float | None
+    pressure_torr: float | None
+    common_name: str
+    broadener: str
+    reference: str
+    resolution: float | None
+    axis_cm1: np.ndarray
+    sigma_cm2_per_molecule: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -403,12 +490,21 @@ def downsample_manual_result(
         pressure_hpa=result.pressure_hpa,
         step_cm1=result.step_cm1,
         range_label=result.range_label,
+        coverage_ranges_cm1_by_gas=result.coverage_ranges_cm1_by_gas,
+        missing_ranges_cm1_by_gas=result.missing_ranges_cm1_by_gas,
+        source_details_by_gas=result.source_details_by_gas,
     )
 
 
 def _ensure_database_started() -> None:
+    global _DB_STARTED, _DB_PATH
     DATA_DIR.mkdir(exist_ok=True)
-    hp.db_begin(str(DATA_DIR))
+    db_path = str(DATA_DIR)
+    if _DB_STARTED and _DB_PATH == db_path:
+        return
+    hp.db_begin(db_path)
+    _DB_STARTED = True
+    _DB_PATH = db_path
 
 
 def _clear_runtime_caches() -> None:
@@ -417,10 +513,546 @@ def _clear_runtime_caches() -> None:
     _cached_offline_sigma_bundle.cache_clear()
     _cached_sigma_bundle.cache_clear()
     _local_table_range.cache_clear()
+    _load_local_xsc_segments.cache_clear()
 
 
 def _has_local_table_cache(gas: str) -> bool:
     return (DATA_DIR / f"{gas}.data").exists() and (DATA_DIR / f"{gas}.header").exists()
+
+
+def _xsc_search_directories() -> tuple[Path, ...]:
+    return (XSC_CACHE_DIR, DATA_DIR)
+
+
+def _iter_local_xsc_paths(gas: str) -> tuple[Path, ...]:
+    expected_tokens = _gas_lookup_tokens(gas)
+    if not expected_tokens:
+        return tuple()
+    seen: set[Path] = set()
+    matches: list[Path] = []
+    for directory in _xsc_search_directories():
+        if not directory.exists():
+            continue
+        for path in sorted(directory.rglob("*.xsc")):
+            stem_token = _gas_lookup_token(path.stem.split("_", 1)[0])
+            if stem_token not in expected_tokens:
+                continue
+            if path not in seen:
+                seen.add(path)
+                matches.append(path)
+    return tuple(matches)
+
+
+def _parse_xsc_optional_float(field: str) -> float | None:
+    text = field.strip().replace("D", "E")
+    if not text:
+        return None
+    return float(text)
+
+
+def _parse_xsc_filename_metadata(path: Path) -> dict[str, float | str | None]:
+    patterns = (
+        r"^(?P<gas>[A-Za-z0-9]+)_(?P<temperature>-?\d+(?:\.\d+)?)K[_-](?P<pressure>-?\d+(?:\.\d+)?)Torr_(?P<nu_min>-?\d+(?:\.\d+)?)\-(?P<nu_max>-?\d+(?:\.\d+)?)_(?P<reference>[^.]+)$",
+        r"^(?P<gas>[A-Za-z0-9]+)_(?P<temperature>-?\d+(?:\.\d+)?)_(?P<pressure>-?\d+(?:\.\d+)?)_(?P<nu_min>-?\d+(?:\.\d+)?)\-(?P<nu_max>-?\d+(?:\.\d+)?)_(?P<reference>[^.]+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, path.stem)
+        if not match:
+            continue
+        return {
+            "gas": match.group("gas"),
+            "temperature_k": float(match.group("temperature")),
+            "pressure_torr": float(match.group("pressure")),
+            "nu_min": float(match.group("nu_min")),
+            "nu_max": float(match.group("nu_max")),
+            "reference": match.group("reference"),
+        }
+    return {
+        "gas": None,
+        "temperature_k": None,
+        "pressure_torr": None,
+        "nu_min": None,
+        "nu_max": None,
+        "reference": "",
+    }
+
+
+def _is_xsc_header_line(line: str) -> bool:
+    if len(line) < 60:
+        return False
+    formula = line[:20].strip()
+    if not formula or " " in formula:
+        return False
+    try:
+        float(line[20:30].strip().replace("D", "E"))
+        float(line[30:40].strip().replace("D", "E"))
+        int(line[40:47].strip())
+    except ValueError:
+        return False
+    return True
+
+
+@lru_cache(maxsize=64)
+def _load_local_xsc_segments(path_str: str, mtime_ns: int, size_bytes: int) -> tuple[CrossSectionSegment, ...]:
+    del mtime_ns, size_bytes
+    path = Path(path_str)
+    raw_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    segments: list[CrossSectionSegment] = []
+
+    first_non_empty = next((line for line in raw_lines if line.strip()), "")
+    if first_non_empty and not _is_xsc_header_line(first_non_empty):
+        axis, sigma = hp.read_xsect(str(path))
+        axis_array = np.asarray(axis, dtype=float)
+        sigma_array = np.maximum(np.asarray(sigma, dtype=float), 0.0)
+        if axis_array.size == 0 or axis_array.size != sigma_array.size:
+            return tuple()
+        filename_metadata = _parse_xsc_filename_metadata(path)
+        gas = str(filename_metadata.get("gas") or path.stem.split("_", 1)[0])
+        return (
+            CrossSectionSegment(
+                gas=gas,
+                path=path,
+                nu_min=float(axis_array[0]),
+                nu_max=float(axis_array[-1]),
+                temperature_k=filename_metadata.get("temperature_k") if isinstance(filename_metadata.get("temperature_k"), float) else None,
+                pressure_torr=filename_metadata.get("pressure_torr") if isinstance(filename_metadata.get("pressure_torr"), float) else None,
+                common_name=gas,
+                broadener="",
+                reference=str(filename_metadata.get("reference") or ""),
+                resolution=None,
+                axis_cm1=axis_array,
+                sigma_cm2_per_molecule=sigma_array,
+            ),
+        )
+
+    line_index = 0
+    while line_index < len(raw_lines):
+        header_line = raw_lines[line_index]
+        if not header_line.strip():
+            line_index += 1
+            continue
+        if not _is_xsc_header_line(header_line):
+            line_index += 1
+            continue
+
+        gas = header_line[:20].strip()
+        nu_min = float(header_line[20:30].strip().replace("D", "E"))
+        nu_max = float(header_line[30:40].strip().replace("D", "E"))
+        point_count = int(header_line[40:47].strip())
+        temperature_k = _parse_xsc_optional_float(header_line[47:54])
+        pressure_torr = _parse_xsc_optional_float(header_line[54:60])
+        resolution = _parse_xsc_optional_float(header_line[70:75])
+        common_name = header_line[75:90].strip()
+        broadener = header_line[94:97].strip()
+        reference = header_line[97:100].strip()
+
+        values: list[float] = []
+        line_index += 1
+        while line_index < len(raw_lines) and len(values) < point_count:
+            value_line = raw_lines[line_index]
+            if _is_xsc_header_line(value_line):
+                break
+            for offset in range(0, len(value_line), 10):
+                field = value_line[offset:offset + 10].strip().replace("D", "E")
+                if not field:
+                    continue
+                try:
+                    values.append(max(float(field), 0.0))
+                except ValueError:
+                    continue
+                if len(values) >= point_count:
+                    break
+            line_index += 1
+
+        if len(values) < point_count:
+            raise ValueError(f"Local XSC file {path.name} ended before {point_count} points were read.")
+
+        segments.append(
+            CrossSectionSegment(
+                gas=gas,
+                path=path,
+                nu_min=nu_min,
+                nu_max=nu_max,
+                temperature_k=temperature_k,
+                pressure_torr=pressure_torr,
+                common_name=common_name,
+                broadener=broadener,
+                reference=reference,
+                resolution=resolution,
+                axis_cm1=np.linspace(nu_min, nu_max, point_count, dtype=float),
+                sigma_cm2_per_molecule=np.asarray(values[:point_count], dtype=float),
+            )
+        )
+
+    return tuple(segments)
+
+
+def _local_xsc_segments_for_gas(gas: str) -> tuple[CrossSectionSegment, ...]:
+    expected_tokens = _gas_lookup_tokens(gas)
+    if not expected_tokens:
+        return tuple()
+    segments: list[CrossSectionSegment] = []
+    load_errors: list[str] = []
+    for path in _iter_local_xsc_paths(gas):
+        filename_token = _gas_lookup_token(path.stem.split("_", 1)[0])
+        try:
+            stat = path.stat()
+            parsed = _load_local_xsc_segments(str(path), stat.st_mtime_ns, stat.st_size)
+        except Exception as exc:
+            load_errors.append(f"{path.name}: {exc}")
+            continue
+        for segment in parsed:
+            segment_token = _gas_lookup_token(segment.gas)
+            if segment_token in expected_tokens or filename_token in expected_tokens:
+                segments.append(segment)
+    if segments:
+        return tuple(segments)
+    if load_errors:
+        sample_errors = "; ".join(load_errors[:2])
+        if len(load_errors) > 2:
+            sample_errors += f"; +{len(load_errors) - 2} weitere"
+        raise ValueError(
+            f"Local HITRAN XSC files were found for {gas}, but none could be parsed. {sample_errors}"
+        )
+    return tuple(segments)
+
+
+def _segment_overlap_cm1(segment: CrossSectionSegment, nu_min: float, nu_max: float) -> float:
+    return max(0.0, min(segment.nu_max, nu_max) - max(segment.nu_min, nu_min))
+
+
+def _merged_interval_length(intervals: list[tuple[float, float]]) -> float:
+    if not intervals:
+        return 0.0
+    ordered = sorted(intervals)
+    current_start, current_end = ordered[0]
+    total = 0.0
+    for start, end in ordered[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+            continue
+        total += current_end - current_start
+        current_start, current_end = start, end
+    total += current_end - current_start
+    return total
+
+
+def _normalize_intervals(intervals: list[tuple[float, float]] | tuple[tuple[float, float], ...]) -> tuple[tuple[float, float], ...]:
+    cleaned = sorted(
+        (float(min(start, end)), float(max(start, end)))
+        for start, end in intervals
+        if max(start, end) > min(start, end)
+    )
+    if not cleaned:
+        return tuple()
+    merged: list[tuple[float, float]] = []
+    current_start, current_end = cleaned[0]
+    for start, end in cleaned[1:]:
+        if start <= current_end + 1.0e-9:
+            current_end = max(current_end, end)
+            continue
+        merged.append((current_start, current_end))
+        current_start, current_end = start, end
+    merged.append((current_start, current_end))
+    return tuple(merged)
+
+
+def _clip_intervals(
+    intervals: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+    lower_bound: float,
+    upper_bound: float,
+) -> tuple[tuple[float, float], ...]:
+    clipped = [
+        (max(float(start), lower_bound), min(float(end), upper_bound))
+        for start, end in intervals
+        if min(float(end), upper_bound) > max(float(start), lower_bound)
+    ]
+    return _normalize_intervals(clipped)
+
+
+def _complement_intervals(
+    covered_intervals: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+    lower_bound: float,
+    upper_bound: float,
+) -> tuple[tuple[float, float], ...]:
+    normalized = _clip_intervals(covered_intervals, lower_bound, upper_bound)
+    if lower_bound >= upper_bound:
+        return tuple()
+    gaps: list[tuple[float, float]] = []
+    cursor = lower_bound
+    for start, end in normalized:
+        if start > cursor:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < upper_bound:
+        gaps.append((cursor, upper_bound))
+    return _normalize_intervals(gaps)
+
+
+def _axis_mask_from_intervals(axis: np.ndarray, intervals: tuple[tuple[float, float], ...]) -> np.ndarray:
+    mask = np.zeros_like(axis, dtype=bool)
+    for start, end in intervals:
+        mask |= (axis >= start) & (axis <= end)
+    return mask
+
+
+def _interpolate_with_zero_outside(
+    target_axis: np.ndarray,
+    source_axis: np.ndarray,
+    source_sigma: np.ndarray,
+) -> np.ndarray:
+    interpolated = np.zeros_like(target_axis, dtype=float)
+    in_bounds = (target_axis >= float(source_axis[0])) & (target_axis <= float(source_axis[-1]))
+    if np.any(in_bounds):
+        interpolated[in_bounds] = np.interp(target_axis[in_bounds], source_axis, source_sigma)
+    return interpolated
+
+
+def _select_local_xsc_segments(
+    gas: str,
+    temperature_c: float,
+    pressure_hpa: float,
+    nu_min: float,
+    nu_max: float,
+) -> tuple[CrossSectionSegment, ...]:
+    segments = _local_xsc_segments_for_gas(gas)
+    if not segments:
+        raise FileNotFoundError(
+            f"No local HITRAN XSC files were found for {gas}. Place .xsc files in {XSC_CACHE_DIR} or {DATA_DIR}."
+        )
+
+    grouped: dict[tuple[Any, ...], list[CrossSectionSegment]] = {}
+    for segment in segments:
+        key = (
+            round(segment.temperature_k, 3) if segment.temperature_k is not None else None,
+            round(segment.pressure_torr, 3) if segment.pressure_torr is not None else None,
+            segment.common_name,
+            segment.broadener,
+            segment.reference,
+        )
+        grouped.setdefault(key, []).append(segment)
+
+    requested_temperature_k = temperature_c + 273.15
+    requested_pressure_torr = pressure_hpa * TORR_PER_HPA
+    best_segments: tuple[CrossSectionSegment, ...] | None = None
+    best_score: tuple[float, float, float] | None = None
+    available_ranges: list[str] = []
+
+    for group_segments in grouped.values():
+        overlaps = [
+            (max(segment.nu_min, nu_min), min(segment.nu_max, nu_max))
+            for segment in group_segments
+            if _segment_overlap_cm1(segment, nu_min, nu_max) > 0.0
+        ]
+        available_ranges.extend(f"{segment.nu_min:.2f}-{segment.nu_max:.2f} cm-1" for segment in group_segments)
+        total_overlap = _merged_interval_length(overlaps)
+        if total_overlap <= 0.0:
+            continue
+
+        group_temperature_k = next((segment.temperature_k for segment in group_segments if segment.temperature_k is not None), None)
+        group_pressure_torr = next((segment.pressure_torr for segment in group_segments if segment.pressure_torr is not None), None)
+        temp_penalty = abs(group_temperature_k - requested_temperature_k) if group_temperature_k is not None else 9999.0
+        pressure_penalty = abs(group_pressure_torr - requested_pressure_torr) if group_pressure_torr is not None else 9999.0
+        score = (total_overlap, -temp_penalty, -pressure_penalty)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_segments = tuple(sorted(group_segments, key=lambda segment: (segment.nu_min, segment.nu_max)))
+
+    if best_segments is None:
+        unique_ranges = sorted(set(available_ranges))
+        range_preview = ", ".join(unique_ranges[:8])
+        if len(unique_ranges) > 8:
+            range_preview += f", +{len(unique_ranges) - 8} weitere"
+        raise ValueError(
+            f"Local HITRAN XSC files for {gas} do not overlap the requested range {nu_min:.2f}-{nu_max:.2f} cm-1. "
+            + (f"Available XSC ranges: {range_preview}." if range_preview else "")
+        )
+
+    return best_segments
+
+
+def _coverage_ranges_for_gas_request(
+    gas: str,
+    temperature_c: float,
+    pressure_hpa: float,
+    nu_min: float,
+    nu_max: float,
+) -> tuple[tuple[float, float], ...]:
+    coverage_sources: list[tuple[float, float]] = []
+
+    cached_table_range = _local_table_range(gas)
+    if cached_table_range is not None:
+        coverage_sources.append(cached_table_range)
+
+    try:
+        segments = _select_local_xsc_segments(gas, temperature_c, pressure_hpa, nu_min, nu_max)
+    except Exception:
+        segments = tuple()
+
+    coverage_sources.extend(
+        (max(segment.nu_min, nu_min), min(segment.nu_max, nu_max))
+        for segment in segments
+        if _segment_overlap_cm1(segment, nu_min, nu_max) > 0.0
+    )
+
+    return _clip_intervals(coverage_sources, nu_min, nu_max)
+
+
+def _local_xsc_can_build(gas: str, temperature_c: float, pressure_hpa: float, nu_min: float, nu_max: float) -> bool:
+    try:
+        _select_local_xsc_segments(gas, temperature_c, pressure_hpa, nu_min, nu_max)
+        return True
+    except Exception:
+        return False
+
+
+def _sigma_from_local_xsc(
+    gas: str,
+    temperature_c: float,
+    pressure_hpa: float,
+    nu_min: float,
+    nu_max: float,
+    step_cm1: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    segments = _select_local_xsc_segments(gas, temperature_c, pressure_hpa, nu_min, nu_max)
+    axis = np.arange(nu_min, nu_max + (step_cm1 * 0.5), step_cm1, dtype=float)
+    if axis.size < 2:
+        raise ValueError("XSC calculation requires at least two spectral points.")
+
+    sigma = np.zeros_like(axis)
+    for segment in segments:
+        overlap_min = max(segment.nu_min, nu_min)
+        overlap_max = min(segment.nu_max, nu_max)
+        if overlap_min > overlap_max:
+            continue
+        mask = (axis >= overlap_min) & (axis <= overlap_max)
+        if not np.any(mask):
+            continue
+        sigma[mask] = np.maximum(
+            sigma[mask],
+            np.interp(axis[mask], segment.axis_cm1, segment.sigma_cm2_per_molecule),
+        )
+    return axis, sigma
+
+
+def _local_cache_covers_range(gas: str, nu_min: float, nu_max: float) -> bool:
+    cached = _local_table_range(gas)
+    if cached is None:
+        return False
+
+    wanted_min = nu_min - FETCH_MARGIN_CM1
+    wanted_max = nu_max + FETCH_MARGIN_CM1
+    return cached[0] <= wanted_min and cached[1] >= wanted_max
+
+
+def _xsc_source_details_for_gas(
+    gas: str,
+    temperature_c: float,
+    pressure_hpa: float,
+    nu_min: float,
+    nu_max: float,
+) -> dict[str, Any] | None:
+    try:
+        segments = _select_local_xsc_segments(gas, temperature_c, pressure_hpa, nu_min, nu_max)
+    except Exception:
+        return None
+
+    if not segments:
+        return None
+
+    temperatures_k = sorted({round(float(segment.temperature_k), 3) for segment in segments if segment.temperature_k is not None})
+    pressures_torr = sorted({round(float(segment.pressure_torr), 3) for segment in segments if segment.pressure_torr is not None})
+    file_names = sorted({segment.path.name for segment in segments})
+    coverage_ranges = _clip_intervals(
+        [(segment.nu_min, segment.nu_max) for segment in segments],
+        nu_min,
+        nu_max,
+    )
+    return {
+        "source": "xsc",
+        "temperature_k": temperatures_k[0] if len(temperatures_k) == 1 else None,
+        "pressure_torr": pressures_torr[0] if len(pressures_torr) == 1 else None,
+        "temperature_k_values": temperatures_k,
+        "pressure_torr_values": pressures_torr,
+        "files": file_names,
+        "coverage_ranges_cm1": [[float(start), float(end)] for start, end in coverage_ranges],
+    }
+
+
+def _line_source_details_for_gas(gas: str, nu_min: float, nu_max: float) -> dict[str, Any] | None:
+    cached = _local_table_range(gas)
+    if cached is None:
+        return None
+    clipped = _clip_intervals([cached], nu_min, nu_max)
+    if not clipped:
+        return None
+    return {
+        "source": "line_cache",
+        "coverage_ranges_cm1": [[float(start), float(end)] for start, end in clipped],
+        "table_range_cm1": [float(cached[0]), float(cached[1])],
+    }
+
+
+def _offline_missing_cache_details(missing_gases: list[str], nu_min: float, nu_max: float) -> str:
+    missing_local: list[str] = []
+    partial_local: list[str] = []
+    wanted_min = nu_min - FETCH_MARGIN_CM1
+    wanted_max = nu_max + FETCH_MARGIN_CM1
+
+    for gas in missing_gases:
+        cached = _local_table_range(gas)
+        if cached is None:
+            missing_local.append(gas)
+            continue
+        if cached[0] > wanted_min or cached[1] < wanted_max:
+            partial_local.append(f"{gas} ({cached[0]:.2f}-{cached[1]:.2f} cm-1)")
+
+    details: list[str] = []
+    if missing_local:
+        details.append("Local HITRAN cache is also missing for: " + ", ".join(missing_local) + ".")
+    if partial_local:
+        details.append("Local HITRAN cache coverage is too small for: " + ", ".join(partial_local) + ".")
+    missing_xsc = [gas for gas in missing_gases if not _local_xsc_can_build(gas, PICKLE_REBUILD_TEMPERATURE_C, PICKLE_REBUILD_PRESSURE_HPA, nu_min, nu_max)]
+    if missing_xsc:
+        details.append("Local HITRAN XSC files are also missing for: " + ", ".join(missing_xsc) + ".")
+    if details:
+        details.append("The last manual refresh likely returned no line data for these gases/ranges.")
+    return " ".join(details)
+
+
+def _repair_offline_library_from_local_cache(
+    missing_gases: list[str],
+    nu_min: float,
+    nu_max: float,
+) -> None:
+    metadata: dict[str, Any] = {}
+    if OFFLINE_SPECTRA_PATH.exists():
+        try:
+            metadata = offline_library_metadata()
+        except Exception:
+            metadata = {}
+
+    repair_temperature_c = float(metadata.get("reference_temperature_c", PICKLE_REBUILD_TEMPERATURE_C))
+    repair_pressure_hpa = float(metadata.get("reference_pressure_hpa", PICKLE_REBUILD_PRESSURE_HPA))
+    rebuildable_gases = [
+        gas
+        for gas in missing_gases
+        if _local_cache_covers_range(gas, nu_min, nu_max)
+        or _local_xsc_can_build(gas, repair_temperature_c, repair_pressure_hpa, nu_min, nu_max)
+    ]
+    if not rebuildable_gases:
+        return
+
+    rebuild_offline_pickle_from_hitran(
+        gases=rebuildable_gases,
+        range_unit="cm-1",
+        range_min=nu_min,
+        range_max=nu_max,
+        step_cm1=float(metadata.get("native_step_cm1", DEFAULT_MANUAL_STEP_CM1)) or DEFAULT_MANUAL_STEP_CM1,
+        temperature_c=repair_temperature_c,
+        pressure_hpa=repair_pressure_hpa,
+        merge_with_existing=True,
+    )
 
 
 @lru_cache(maxsize=LOCAL_CACHE_MAX_GASES)
@@ -503,7 +1135,12 @@ def _is_hapi_parse_error(exc: Exception) -> bool:
     return "parse error" in message or "unknown format of the par value" in message
 
 
-def _sigma_from_local_db(
+def _is_no_line_data_error(exc: Exception) -> bool:
+    message = str(exc)
+    return "Failed to retrieve data for given parameters" in message or "keine HITRAN-Liniendaten" in message
+
+
+def _sigma_from_hitran_lines(
     gas: str,
     temperature_c: float,
     pressure_hpa: float,
@@ -546,9 +1183,52 @@ def _sigma_from_local_db(
     return np.asarray(current_nu, dtype=float), np.asarray(current_sigma, dtype=float)
 
 
+def _sigma_from_local_db(
+    gas: str,
+    temperature_c: float,
+    pressure_hpa: float,
+    nu_min: float,
+    nu_max: float,
+    step_cm1: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if _local_xsc_can_build(gas, temperature_c, pressure_hpa, nu_min, nu_max):
+        return _sigma_from_local_xsc(
+            gas=gas,
+            temperature_c=temperature_c,
+            pressure_hpa=pressure_hpa,
+            nu_min=nu_min,
+            nu_max=nu_max,
+            step_cm1=step_cm1,
+        )
+    try:
+        return _sigma_from_hitran_lines(
+            gas=gas,
+            temperature_c=temperature_c,
+            pressure_hpa=pressure_hpa,
+            nu_min=nu_min,
+            nu_max=nu_max,
+            step_cm1=step_cm1,
+        )
+    except Exception as line_exc:
+        try:
+            return _sigma_from_local_xsc(
+                gas=gas,
+                temperature_c=temperature_c,
+                pressure_hpa=pressure_hpa,
+                nu_min=nu_min,
+                nu_max=nu_max,
+                step_cm1=step_cm1,
+            )
+        except Exception as xsc_exc:
+            if _is_no_line_data_error(line_exc):
+                raise ValueError(f"{line_exc}. Local XSC fallback also unavailable: {xsc_exc}") from line_exc
+            raise line_exc from xsc_exc
+
+
 def _write_offline_sigma_library(
     library: dict[str, tuple[np.ndarray, np.ndarray]],
     metadata: dict[str, Any] | None = None,
+    coverage_ranges: dict[str, tuple[tuple[float, float], ...]] | None = None,
 ) -> None:
     serializable_library = {
         gas: (np.asarray(axis, dtype=float), np.asarray(sigma, dtype=float))
@@ -565,6 +1245,11 @@ def _write_offline_sigma_library(
     }
     if metadata:
         payload["metadata"].update(metadata)
+    if coverage_ranges is not None:
+        payload["coverage_ranges"] = {
+            gas: [[float(start), float(end)] for start, end in _normalize_intervals(ranges)]
+            for gas, ranges in coverage_ranges.items()
+        }
     with OFFLINE_SPECTRA_PATH.open("wb") as file_handle:
         pickle.dump(payload, file_handle, protocol=pickle.HIGHEST_PROTOCOL)
     _clear_runtime_caches()
@@ -647,6 +1332,7 @@ def rebuild_offline_pickle_from_hitran(
             gas: (axis.copy(), sigma.copy())
             for gas, (axis, sigma) in _load_offline_sigma_library().items()
         }
+        coverage_ranges = dict(_load_offline_coverage_ranges())
         updated_gases: list[str] = []
         for gas in selected_gases:
             if gas in library:
@@ -655,7 +1341,7 @@ def rebuild_offline_pickle_from_hitran(
                 union_min = min(float(axis[0]), nu_min)
                 union_max = max(float(axis[-1]), nu_max)
                 union_axis = np.arange(union_min, union_max + (local_step * 0.5), local_step, dtype=float)
-                union_sigma = np.interp(union_axis, axis, sigma)
+                union_sigma = _interpolate_with_zero_outside(union_axis, axis, sigma)
             else:
                 local_step = float(step_cm1 or DEFAULT_MANUAL_STEP_CM1)
                 union_axis = np.arange(nu_min, nu_max + (local_step * 0.5), local_step, dtype=float)
@@ -669,9 +1355,12 @@ def rebuild_offline_pickle_from_hitran(
                 nu_max=nu_max,
                 step_cm1=local_step,
             )
-            replace_mask = (union_axis >= nu_min) & (union_axis <= nu_max)
-            union_sigma[replace_mask] = np.interp(union_axis[replace_mask], current_nu, current_sigma)
+            current_ranges = _coverage_ranges_for_gas_request(gas, temperature_c, pressure_hpa, nu_min, nu_max)
+            replace_mask = _axis_mask_from_intervals(union_axis, current_ranges)
+            if np.any(replace_mask):
+                union_sigma[replace_mask] = np.interp(union_axis[replace_mask], current_nu, current_sigma)
             library[gas] = (union_axis, union_sigma)
+            coverage_ranges[gas] = _normalize_intervals(list(coverage_ranges.get(gas, tuple())) + list(current_ranges))
             updated_gases.append(gas)
 
         _write_offline_sigma_library(
@@ -681,6 +1370,7 @@ def rebuild_offline_pickle_from_hitran(
                 "reference_temperature_c": temperature_c,
                 "reference_pressure_hpa": pressure_hpa,
             },
+            coverage_ranges=coverage_ranges,
         )
         return (
             f"Offline-PKL fuer {', '.join(updated_gases)} im Bereich {nu_min:.2f}-{nu_max:.2f} cm-1 aktualisiert "
@@ -693,6 +1383,7 @@ def rebuild_offline_pickle_from_hitran(
         raise ValueError("Pickle generation requires at least two spectral points.")
 
     library: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    coverage_ranges: dict[str, tuple[tuple[float, float], ...]] = {}
     for gas in selected_gases:
         current_nu, current_sigma = _sigma_from_local_db(
             gas=gas,
@@ -702,7 +1393,13 @@ def rebuild_offline_pickle_from_hitran(
             nu_max=nu_max,
             step_cm1=effective_step,
         )
-        library[gas] = (common_axis, np.interp(common_axis, current_nu, current_sigma))
+        gas_sigma = np.zeros_like(common_axis)
+        current_ranges = _coverage_ranges_for_gas_request(gas, temperature_c, pressure_hpa, nu_min, nu_max)
+        replace_mask = _axis_mask_from_intervals(common_axis, current_ranges)
+        if np.any(replace_mask):
+            gas_sigma[replace_mask] = np.interp(common_axis[replace_mask], current_nu, current_sigma)
+        library[gas] = (common_axis, gas_sigma)
+        coverage_ranges[gas] = current_ranges
 
     _write_offline_sigma_library(
         library,
@@ -711,6 +1408,7 @@ def rebuild_offline_pickle_from_hitran(
             "reference_temperature_c": temperature_c,
             "reference_pressure_hpa": pressure_hpa,
         },
+        coverage_ranges=coverage_ranges,
     )
     return (
         f"Offline-PKL neu erzeugt fuer {', '.join(selected_gases)} im Bereich {nu_min:.2f}-{nu_max:.2f} cm-1 "
@@ -753,6 +1451,38 @@ def _load_offline_sigma_library() -> dict[str, tuple[np.ndarray, np.ndarray]]:
         library[str(gas)] = (axis, sigma)
 
     return library
+
+
+@lru_cache(maxsize=1)
+def _load_offline_coverage_ranges() -> dict[str, tuple[tuple[float, float], ...]]:
+    if not OFFLINE_SPECTRA_PATH.exists():
+        raise FileNotFoundError(
+            f"Offline spectra file not found: {OFFLINE_SPECTRA_PATH.name}."
+        )
+
+    with OFFLINE_SPECTRA_PATH.open("rb") as file_handle:
+        raw_library = pickle.load(file_handle)
+
+    coverage_payload = raw_library.get("coverage_ranges", {}) if isinstance(raw_library, dict) else {}
+    coverage_ranges: dict[str, tuple[tuple[float, float], ...]] = {}
+    if isinstance(coverage_payload, dict):
+        for gas, raw_ranges in coverage_payload.items():
+            parsed_ranges: list[tuple[float, float]] = []
+            if isinstance(raw_ranges, (list, tuple)):
+                for raw_range in raw_ranges:
+                    if not isinstance(raw_range, (list, tuple)) or len(raw_range) < 2:
+                        continue
+                    parsed_ranges.append((float(raw_range[0]), float(raw_range[1])))
+            coverage_ranges[str(gas)] = _normalize_intervals(parsed_ranges)
+
+    if coverage_ranges:
+        return coverage_ranges
+
+    library = _load_offline_sigma_library()
+    return {
+        gas: ((float(axis[0]), float(axis[-1])),)
+        for gas, (axis, _sigma) in library.items()
+    }
 
 
 @lru_cache(maxsize=1)
@@ -806,25 +1536,13 @@ def _cached_offline_sigma_bundle(
     library = _load_offline_sigma_library()
     missing_gases = [gas for gas in gases if gas not in library]
     if missing_gases:
-        raise ValueError(
-            "Offline spectra are missing for: "
-            + ", ".join(missing_gases)
-            + ". Refresh HITRAN manually and rebuild the pickle before using these gases here."
-        )
-
-    coverage_min = max(float(library[gas][0][0]) for gas in gases)
-    coverage_max = min(float(library[gas][0][-1]) for gas in gases)
-    coverage_tolerance_cm1 = max(1e-6, abs(coverage_min) * 1e-12, abs(coverage_max) * 1e-12)
-    if nu_min < (coverage_min - coverage_tolerance_cm1) or nu_max > (coverage_max + coverage_tolerance_cm1):
-        raise ValueError(
-            "Requested range is outside offline pickle coverage "
-            f"({coverage_min:.2f}-{coverage_max:.2f} cm-1). "
-            "Use the manual HITRAN refresh only to update the local DB, then rebuild the pickle for plotting."
-        )
-    nu_min = max(nu_min, coverage_min)
-    nu_max = min(nu_max, coverage_max)
-
-    reference_axis = library[gases[0]][0]
+        _repair_offline_library_from_local_cache(missing_gases, nu_min, nu_max)
+        library = _load_offline_sigma_library()
+    coverage_ranges = _load_offline_coverage_ranges()
+    reference_axis = next((library[gas][0] for gas in gases if gas in library), None)
+    if reference_axis is None:
+        target_axis = np.arange(nu_min, nu_max + (float(step_cm1) * 0.5), float(step_cm1), dtype=float)
+        return target_axis, {gas: np.zeros_like(target_axis) for gas in gases}
     native_step = float(np.median(np.diff(reference_axis))) if reference_axis.size > 1 else step_cm1
     target_step = max(float(step_cm1), native_step)
     point_count = max(2, int(np.floor((nu_max - nu_min) / target_step)) + 1)
@@ -832,8 +1550,17 @@ def _cached_offline_sigma_bundle(
 
     sigma_map: dict[str, np.ndarray] = {}
     for gas in gases:
+        if gas not in library:
+            sigma_map[gas] = np.zeros_like(target_axis)
+            continue
         gas_axis, gas_sigma = library[gas]
-        sigma_map[gas] = np.interp(target_axis, gas_axis, gas_sigma)
+        gas_ranges = _clip_intervals(coverage_ranges.get(gas, ((float(gas_axis[0]), float(gas_axis[-1])),)), nu_min, nu_max)
+        interpolated = _interpolate_with_zero_outside(target_axis, gas_axis, gas_sigma)
+        if gas_ranges:
+            interpolated[~_axis_mask_from_intervals(target_axis, gas_ranges)] = 0.0
+        else:
+            interpolated[:] = 0.0
+        sigma_map[gas] = interpolated
 
     return target_axis, sigma_map
 
@@ -854,9 +1581,19 @@ def refresh_hitran_database(
 
     _ensure_database_started()
     replaced_tables: list[str] = []
-    successful_gases: list[str] = []
+    successful_line_gases: list[str] = []
+    successful_xsc_gases: list[str] = []
     failed_gases: list[str] = []
     for gas in selected_gases:
+        if _local_xsc_can_build(
+            gas,
+            PICKLE_REBUILD_TEMPERATURE_C,
+            PICKLE_REBUILD_PRESSURE_HPA,
+            nu_min,
+            nu_max,
+        ):
+            successful_xsc_gases.append(gas)
+            continue
         gas_config = GAS_LIBRARY[gas]
         temp_table = f"__tmp__{gas}"
         reset_hitran_tables((temp_table,))
@@ -870,17 +1607,24 @@ def refresh_hitran_database(
             )
             replaced_tables.extend(_replace_hitran_table_from_temp(temp_table, gas))
             _FETCHED_RANGES[gas] = (fetch_min, fetch_max)
-            successful_gases.append(gas)
+            successful_line_gases.append(gas)
         except Exception as exc:
             reset_hitran_tables((temp_table,))
-            exc_text = str(exc)
-            if gas == "SF6" and "Failed to retrieve data for given parameters" in exc_text:
+            original_exc_text = str(exc)
+            exc_text = original_exc_text
+            if gas == "SF6" and "Failed to retrieve data for given parameters" in original_exc_text:
                 exc_text = (
                     "aktueller HITRAN/HAPI-Refreshpfad liefert fuer SF6 keine Linienliste; "
                     "SF6 ist dort sehr wahrscheinlich nur als Cross-Section/XSC verfuegbar"
                 )
+            elif "Failed to retrieve data for given parameters" in original_exc_text:
+                exc_text = (
+                    "keine HITRAN-Liniendaten im angeforderten Bereich "
+                    f"{nu_min:.2f}-{nu_max:.2f} cm-1"
+                )
             failed_gases.append(f"{gas} ({exc_text})")
 
+    successful_gases = successful_line_gases + successful_xsc_gases
     if not successful_gases:
         failure_preview = "; ".join(failed_gases[:8])
         raise ValueError(
@@ -904,6 +1648,8 @@ def refresh_hitran_database(
     cleanup_bits: list[str] = []
     if replaced_tables:
         cleanup_bits.append("Ersetzte Tabellen: " + ", ".join(replaced_tables[:12]))
+    if successful_xsc_gases:
+        cleanup_bits.append("Lokale XSC genutzt: " + ", ".join(successful_xsc_gases[:12]))
     if removed_legacy_files:
         cleanup_bits.append("Altdateien: " + ", ".join(removed_legacy_files))
     cleanup_suffix = f" Aufgeraeumt ({'; '.join(cleanup_bits)})." if cleanup_bits else ""
@@ -917,9 +1663,9 @@ def refresh_hitran_database(
         skipped_suffix = " Uebersprungen ohne Treffer/bei Fehler: " + skipped_preview + "."
 
     return (
-        f"Lokaler HITRAN/HAPI-Cache fuer {', '.join(successful_gases)} aktualisiert "
+        f"Lokale Spektralquellen fuer {', '.join(successful_gases)} aktualisiert "
         f"({fetch_min:.2f}-{fetch_max:.2f} cm-1 inkl. Rand). "
-        "Die Live-Berechnung nutzt diese Tabellen sofort; offline funktionieren danach genau diese lokal gecachten Bereiche auch ohne Download."
+        "Die Live-Berechnung nutzt diese lokalen Quellen sofort; offline funktionieren danach genau diese lokal gecachten Bereiche auch ohne Download."
         f" {offline_message}{skipped_suffix}{cleanup_suffix}"
     )
 
@@ -935,8 +1681,8 @@ def _cached_sigma_bundle(
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     sigma_map: dict[str, np.ndarray] = {}
     axis: np.ndarray | None = None
-    try:
-        for gas in gases:
+    for gas in gases:
+        try:
             current_nu_array, current_sigma_array = _sigma_from_local_db(
                 gas=gas,
                 temperature_c=temperature_c,
@@ -945,23 +1691,24 @@ def _cached_sigma_bundle(
                 nu_max=nu_max,
                 step_cm1=step_cm1,
             )
-            if axis is None:
-                axis = current_nu_array
-            sigma_map[gas] = current_sigma_array
-    except Exception:
-        offline_axis, offline_sigma_map = _cached_offline_sigma_bundle(
-            gases,
-            nu_min,
-            nu_max,
-            step_cm1,
-        )
-        return offline_axis, {
-            gas: np.asarray(offline_sigma_map[gas], dtype=float)
-            for gas in gases
-        }
+        except Exception:
+            current_nu_array, offline_sigma_map = _cached_offline_sigma_bundle(
+                (gas,),
+                nu_min,
+                nu_max,
+                step_cm1,
+            )
+            current_sigma_array = offline_sigma_map[gas]
+
+        if axis is None:
+            axis = np.asarray(current_nu_array, dtype=float)
+        if current_nu_array.shape != axis.shape or not np.allclose(current_nu_array, axis):
+            sigma_map[gas] = np.interp(axis, current_nu_array, current_sigma_array)
+        else:
+            sigma_map[gas] = np.asarray(current_sigma_array, dtype=float)
 
     if axis is None:
-        raise ValueError("No gases were provided for spectrum calculation.")
+        axis = np.arange(nu_min, nu_max + (float(step_cm1) * 0.5), float(step_cm1), dtype=float)
     return axis, sigma_map
 
 
@@ -1005,6 +1752,46 @@ def build_manual_spectrum(
             round(nu_max, 6),
             round(effective_step, 6),
         )
+    if data_source == OFFLINE_DB_MODE:
+        offline_coverage_ranges = _load_offline_coverage_ranges()
+        coverage_ranges_cm1_by_gas = {
+            gas: _clip_intervals(offline_coverage_ranges.get(gas, tuple()), float(wavenumber_cm1[0]), float(wavenumber_cm1[-1]))
+            for gas in gas_tuple
+        }
+        source_details_by_gas = {
+            gas: {
+                "source": "offline_db",
+                "reference_temperature_c": float(temperature_c),
+                "reference_pressure_hpa": float(pressure_hpa),
+                "coverage_ranges_cm1": [[float(start), float(end)] for start, end in coverage_ranges_cm1_by_gas.get(gas, tuple())],
+            }
+            for gas in gas_tuple
+        }
+    else:
+        coverage_ranges_cm1_by_gas = {
+            gas: _coverage_ranges_for_gas_request(gas, temperature_c, pressure_hpa, float(wavenumber_cm1[0]), float(wavenumber_cm1[-1]))
+            for gas in gas_tuple
+        }
+        source_details_by_gas = {}
+        request_nu_min = float(wavenumber_cm1[0])
+        request_nu_max = float(wavenumber_cm1[-1])
+        for gas in gas_tuple:
+            xsc_details = _xsc_source_details_for_gas(gas, temperature_c, pressure_hpa, request_nu_min, request_nu_max)
+            if xsc_details is not None:
+                source_details_by_gas[gas] = xsc_details
+                continue
+            line_details = _line_source_details_for_gas(gas, request_nu_min, request_nu_max)
+            if line_details is not None:
+                source_details_by_gas[gas] = line_details
+            else:
+                source_details_by_gas[gas] = {
+                    "source": "unavailable",
+                    "coverage_ranges_cm1": [],
+                }
+    missing_ranges_cm1_by_gas = {
+        gas: _complement_intervals(coverage_ranges_cm1_by_gas.get(gas, tuple()), float(wavenumber_cm1[0]), float(wavenumber_cm1[-1]))
+        for gas in gas_tuple
+    }
     wavelength_um = np.asarray(wavenumber_cm1_to_wavelength_um(wavenumber_cm1), dtype=float)
     number_density = total_number_density_cm3(temperature_c, pressure_hpa)
     total_sigma = np.zeros_like(wavenumber_cm1, dtype=float)
@@ -1042,6 +1829,9 @@ def build_manual_spectrum(
         pressure_hpa=pressure_hpa,
         step_cm1=effective_step,
         range_label=range_label,
+        coverage_ranges_cm1_by_gas=coverage_ranges_cm1_by_gas,
+        missing_ranges_cm1_by_gas=missing_ranges_cm1_by_gas,
+        source_details_by_gas=source_details_by_gas,
     )
 
 
@@ -1067,6 +1857,15 @@ def serialize_manual_result(result: ManualSpectrumResult) -> dict[str, Any]:
         "pressure_hpa": result.pressure_hpa,
         "step_cm1": result.step_cm1,
         "range_label": result.range_label,
+        "coverage_ranges_cm1_by_gas": {
+            gas: [[float(start), float(end)] for start, end in ranges]
+            for gas, ranges in result.coverage_ranges_cm1_by_gas.items()
+        },
+        "missing_ranges_cm1_by_gas": {
+            gas: [[float(start), float(end)] for start, end in ranges]
+            for gas, ranges in result.missing_ranges_cm1_by_gas.items()
+        },
+        "source_details_by_gas": result.source_details_by_gas,
     }
 
 
@@ -1092,6 +1891,19 @@ def deserialize_manual_result(payload: dict[str, Any]) -> ManualSpectrumResult:
         pressure_hpa=float(payload["pressure_hpa"]),
         step_cm1=float(payload["step_cm1"]),
         range_label=payload["range_label"],
+        coverage_ranges_cm1_by_gas={
+            gas: tuple((float(start), float(end)) for start, end in ranges)
+            for gas, ranges in payload.get("coverage_ranges_cm1_by_gas", {}).items()
+        },
+        missing_ranges_cm1_by_gas={
+            gas: tuple((float(start), float(end)) for start, end in ranges)
+            for gas, ranges in payload.get("missing_ranges_cm1_by_gas", {}).items()
+        },
+        source_details_by_gas={
+            str(gas): details
+            for gas, details in payload.get("source_details_by_gas", {}).items()
+            if isinstance(details, dict)
+        },
     )
 
 

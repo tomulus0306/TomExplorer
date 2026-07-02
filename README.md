@@ -19,6 +19,7 @@ Danach oeffnet die App lokal im Browser unter der von Dash ausgegebenen Adresse.
 - VS Code soll mit dem globalen Python laufen. Eine versehentlich mitkopierte `.venv` ist fuer dieses Projekt nicht noetig und kann ignoriert werden.
 - Die manuelle Spektrenberechnung und die Bandensuche laufen temperatur- und druckabhaengig direkt ueber die lokale HAPI/HITRAN-Datenbank in `hitran_cache/`.
 - Die Schaltflaeche fuer den HITRAN-Refresh laedt die gewaehlten Gase neu, baut die Offline-Datei `abscross_dict.pkl` fuer den Bereich neu auf und raeumt alte ungenutzte Hilfsdateien weg.
+- Fuer Gase ohne brauchbare Linienliste im gewaehlten Bereich, z. B. CF4 oder SF6, kann TomExplorer lokale HITRAN-Cross-Section-Dateien (`.xsc`) als Fallback verwenden. Lege solche Dateien in `hitran_cache/xsc/`, gern auch in Unterordnern pro Molekuel, oder direkt in `hitran_cache/` ab.
 - `abscross_dict.pkl` bleibt als Offline-Export erhalten, ist aber nicht mehr die Quelle fuer die aktuellen Live-Plots.
 - Der erste Zugriff auf ein Gas oder einen neuen Bereich kann spuerbar dauern, weil TomExplorer die benoetigten HITRAN-Daten erst lokal laden muss.
 - Die Startmeldung zu HAPI2 kommt direkt aus der mitgelieferten HAPI-Bibliothek. Sie ist nur ein Hinweis des HITRAN-Teams auf eine erweiterte Zusatzbibliothek und kein Fehler.

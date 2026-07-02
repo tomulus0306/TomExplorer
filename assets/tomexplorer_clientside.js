@@ -159,7 +159,17 @@
 
     const props = getDashComponentProps(storeId);
     const serializedResult = selectResult(props ? props.data : null);
+    if (!serializedResult) {
+      const fallback = defaultPanel();
+      panelHost.__tomExplorerHoverSignature = "default";
+      setPanelChildren(panelId, fallback);
+      return;
+    }
+
     const hoverData = typeof hoverDataResolver === "function" ? hoverDataResolver(graphId) : currentGraphHoverData(graphId);
+    if (!hoverData) {
+      return;
+    }
     const signatureKey = `__tomExplorerHoverSignature_${panelId}`;
     const signature = hoverSignature(hoverData, serializedResult);
     if (panelHost[signatureKey] === signature) {
@@ -199,25 +209,35 @@
     }
     const components = serializedResult.components || {};
 
-    const rows = Object.keys(components).map((gas) => {
+    const entries = Object.keys(components).map((gas) => {
       const component = components[gas];
       const sigma = Number(component.sigma_cm2_per_molecule[sampleIndex]);
       const alpha = Number(component.alpha_per_cm[sampleIndex]);
       const concentration = Number(component.concentration);
-      return html("Div", {
-        className: "hover-row",
-        children: [
-          html("Span", {
-            className: "hover-gas",
-            style: { color: component.color || "#1f2937" },
-            children: displayFormula(gas),
-          }),
-          html("Span", { children: `σ [cm²/Molekül] ${sigma.toExponential(3)}` }),
-          html("Span", { children: `α [1/cm] ${alpha.toExponential(3)}` }),
-          html("Span", { children: formatConcentration(concentration) }),
-        ],
-      });
+      return {
+        gas,
+        component,
+        sigma,
+        alpha,
+        concentration,
+      };
     });
+
+    entries.sort((left, right) => Math.abs(right.alpha) - Math.abs(left.alpha));
+
+    const rows = entries.map((entry) => html("Div", {
+      className: "hover-row",
+      children: [
+        html("Span", {
+          className: "hover-gas",
+          style: { color: entry.component.color || "#1f2937" },
+          children: displayFormula(entry.gas),
+        }),
+        html("Span", { children: `σ [cm²/Molekül] ${entry.sigma.toExponential(3)}` }),
+        html("Span", { children: `α [1/cm] ${entry.alpha.toExponential(3)}` }),
+        html("Span", { children: formatConcentration(entry.concentration) }),
+      ],
+    }));
 
     return html("Div", {
       className: "hover-card",
@@ -260,12 +280,26 @@
   window.dash_clientside = Object.assign({}, window.dash_clientside, {
     tomexplorer: {
       manual_hover_children: function (hoverData, serializedResult, currentChildren) {
+        if (!serializedResult) {
+          return defaultPanel();
+        }
         const liveHoverData = currentGraphHoverData("manual-graph");
-        return buildHoverChildren(liveHoverData || hoverData, serializedResult);
+        const effectiveHoverData = liveHoverData || hoverData;
+        if (!effectiveHoverData) {
+          return currentChildren || defaultPanel();
+        }
+        return buildHoverChildren(effectiveHoverData, serializedResult);
       },
       search_hover_children: function (hoverData, store, currentChildren) {
+        if (!store || !store.spectrum) {
+          return defaultPanel();
+        }
         const liveHoverData = currentSearchHoverData();
-        return buildHoverChildren(liveHoverData || hoverData, store && store.spectrum ? store.spectrum : null);
+        const effectiveHoverData = liveHoverData || hoverData;
+        if (!effectiveHoverData) {
+          return currentChildren || defaultPanel();
+        }
+        return buildHoverChildren(effectiveHoverData, store.spectrum);
       },
     },
   });
