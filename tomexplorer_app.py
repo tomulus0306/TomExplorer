@@ -35,10 +35,14 @@ from tomexplorer_core import (
     format_concentration,
     gas_options,
     hover_payload,
+    list_manual_result_snapshots,
+    load_manual_result_snapshot,
+    load_matching_manual_result_snapshot,
     normalize_wavenumber_window,
     offline_library_summary,
     recommended_step_cm1,
     refresh_hitran_database,
+    save_manual_result_snapshot,
     serialize_laser_plan,
     serialize_manual_result,
     suggest_laser_plans,
@@ -56,6 +60,11 @@ HITRAN_RUNTIME_LABEL = f"HAPI {getattr(hp, 'HAPI_VERSION', 'unbekannt')}"
 SEARCH_PLOT_FINE_STEP_CM1 = 0.001
 SEARCH_PLOT_FINE_MAX_POINTS = 15000
 SEARCH_PLOT_PADDING_UM = 0.00075
+PAS_REFERENCE_SIGMA_NV = 18.0
+PAS_REFERENCE_POPT_MW = 11.0
+PAS_REFERENCE_EPS = 1.0
+PAS_REFERENCE_DELTA_ALPHA_MIN = 1.8e-7
+PAS_REFERENCE_CONCENTRATION_PPBV = 7.0
 UNIT_OPTIONS = [
     {"label": "ppb", "value": "ppb"},
     {"label": "ppm", "value": "ppm"},
@@ -83,6 +92,7 @@ ALL_GASES = sorted(GAS_LIBRARY.keys())
 CACHE_STALENESS_DAYS = 30
 BUTTON_LOCK_HIDDEN = {"display": "none"}
 BUTTON_LOCK_VISIBLE = {"display": "flex"}
+MANUAL_CANCEL_EVENT = threading.Event()
 
 MANUAL_CONCENTRATION_STATES = [
     State(f"manual-concentration-value-{gas}", "value") for gas in ALL_GASES
@@ -273,6 +283,16 @@ def latest_hitran_cache_age_days() -> float | None:
     return (time.time() - newest_mtime) / 86400.0
 
 
+def relayout_has_explicit_x_range(relayout_data: dict[str, Any] | None) -> bool:
+    if not relayout_data:
+        return False
+    keys = set(relayout_data.keys())
+    return (
+        "xaxis.range" in keys
+        or ("xaxis.range[0]" in keys and "xaxis.range[1]" in keys)
+    )
+
+
 def cached_hitran_gases() -> list[str]:
     return sorted(
         path.stem
@@ -306,6 +326,39 @@ def format_file_size(size_bytes: int | float) -> str:
         unit_index += 1
     precision = 0 if unit_index == 0 else 1 if size >= 10 else 2
     return f"{size:.{precision}f} {units[unit_index]}"
+
+
+def molar_fraction_to_value_unit(molar_fraction: float) -> tuple[float, str]:
+    value = max(float(molar_fraction), 0.0)
+    if value >= 1.0e-2:
+        return value * 100.0, "%"
+    if value >= 1.0e-6:
+        return value * 1.0e6, "ppm"
+    return value * 1.0e9, "ppb"
+
+
+def manual_cache_option_label(entry: dict[str, Any]) -> str:
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    timestamp = str(entry.get("updated_at", ""))
+    step = _safe_float(entry.get("step_cm1", 0.0), 0.0)
+    temperature_c = _safe_float(entry.get("temperature_c", 0.0), 0.0)
+    pressure_hpa = _safe_float(entry.get("pressure_hpa", 0.0), 0.0)
+    points = _safe_int(entry.get("point_count", 0), 0)
+    return (
+        f"{timestamp} | T={temperature_c:.1f} °C | p={pressure_hpa:.2f} hPa | "
+        f"Schritt={step:.4f} cm⁻¹ | {points} Punkte"
+    )
 
 
 def offline_db_state() -> tuple[bool, str, str]:
@@ -422,6 +475,385 @@ def parse_required_number(value: float | int | None, label: str) -> float:
     return float(value)
 
 
+def sanitize_pas_sigma(value: float | int | None) -> float:
+    if value in (None, ""):
+        return PAS_REFERENCE_SIGMA_NV
+    return max(float(value), 0.0)
+
+
+def sanitize_pas_popt(value: float | int | None) -> float:
+    if value in (None, ""):
+        return PAS_REFERENCE_POPT_MW
+    return max(float(value), 1.0e-12)
+
+
+def sanitize_pas_eps(value: float | int | None) -> float:
+    if value in (None, ""):
+        return PAS_REFERENCE_EPS
+    return min(1.0, max(0.0, float(value)))
+
+
+def compute_pas_delta_alpha_min(
+    sigma_3nv: float | int | None,
+    p_opt_mw: float | int | None,
+    eps_value: float | int | None,
+) -> float:
+    sigma = sanitize_pas_sigma(sigma_3nv)
+    p_opt = sanitize_pas_popt(p_opt_mw)
+    eps = sanitize_pas_eps(eps_value)
+    return (
+        PAS_REFERENCE_DELTA_ALPHA_MIN
+        * (sigma / PAS_REFERENCE_SIGMA_NV)
+        * (PAS_REFERENCE_POPT_MW / p_opt)
+        * (eps / PAS_REFERENCE_EPS)
+    )
+
+
+def pas_signature(serialized_result: dict[str, Any] | None, visible_gases: list[str] | None) -> str:
+    if not serialized_result:
+        return "empty"
+    gases = sorted(visible_gases or list((serialized_result.get("components") or {}).keys()))
+    render_revision = serialized_result.get("render_revision")
+    point_count = len(serialized_result.get("wavelength_um") or [])
+    return f"{render_revision}|{point_count}|{'/'.join(gases)}"
+
+
+def selected_total_alpha(
+    serialized_result: dict[str, Any],
+    visible_gases: list[str] | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    result = deserialize_manual_result(serialized_result)
+    visible_set = {
+        gas
+        for gas in (visible_gases or list(result.components.keys()))
+        if gas in result.components
+    }
+    if not visible_set:
+        visible_set = set(result.components.keys())
+    total_alpha = np.zeros_like(result.total_alpha_per_cm, dtype=float)
+    for gas in visible_set:
+        total_alpha += result.components[gas].alpha_per_cm
+    return result.wavelength_um, result.wavenumber_cm1, total_alpha
+
+
+def nearest_index(values: np.ndarray, target: float) -> int:
+    return int(np.argmin(np.abs(values - float(target))))
+
+
+def detect_peak_region(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    probe_index: int,
+) -> dict[str, Any] | None:
+    if x_values.size < 7 or y_values.size != x_values.size:
+        return None
+    index = int(min(max(probe_index, 0), x_values.size - 1))
+    smooth_window = 7
+    kernel = np.ones(smooth_window, dtype=float) / float(smooth_window)
+    y_smooth = np.convolve(y_values, kernel, mode="same")
+    local_span = min(max(12, x_values.size // 250), 80)
+    local_start = max(0, index - local_span)
+    local_end = min(x_values.size - 1, index + local_span)
+    apex_index = int(local_start + np.argmax(y_smooth[local_start : local_end + 1]))
+
+    max_span = max(30, int(x_values.size * 0.12))
+    left_index = apex_index
+    while left_index > 1 and (apex_index - left_index) < max_span:
+        if y_smooth[left_index - 1] <= y_smooth[left_index]:
+            left_index -= 1
+            continue
+        break
+
+    right_index = apex_index
+    while right_index < x_values.size - 2 and (right_index - apex_index) < max_span:
+        if y_smooth[right_index + 1] <= y_smooth[right_index]:
+            right_index += 1
+            continue
+        break
+
+    if left_index >= apex_index or right_index <= apex_index:
+        return None
+
+    baseline_at_apex = float(np.interp(apex_index, [left_index, right_index], [y_values[left_index], y_values[right_index]]))
+    delta_alpha = max(float(y_values[apex_index]) - baseline_at_apex, 0.0)
+    if not np.isfinite(delta_alpha) or delta_alpha <= 0.0:
+        return None
+
+    return {
+        "left": int(left_index),
+        "right": int(right_index),
+        "apex": int(apex_index),
+        "delta_alpha": float(delta_alpha),
+        "apex_alpha": float(y_values[apex_index]),
+    }
+
+
+def local_maxima_indices(values: np.ndarray) -> np.ndarray:
+    if values.size < 3:
+        return np.asarray([], dtype=int)
+    left = values[1:-1] > values[:-2]
+    right = values[1:-1] >= values[2:]
+    return np.flatnonzero(left & right) + 1
+
+
+def peak_from_interaction(
+    interaction_data: dict[str, Any] | None,
+    serialized_result: dict[str, Any] | None,
+    visible_gases: list[str] | None,
+    x_unit: str,
+) -> dict[str, Any] | None:
+    if not interaction_data or not serialized_result:
+        return None
+    points = interaction_data.get("points") or []
+    if not points:
+        return None
+    point = points[0] or {}
+    x_value = interaction_x_value(point, x_unit)
+    if x_value is None:
+        return None
+
+    result = deserialize_manual_result(serialized_result)
+    visible_set = {
+        gas
+        for gas in (visible_gases or list(result.components.keys()))
+        if gas in result.components
+    }
+    if not visible_set:
+        visible_set = set(result.components.keys())
+
+    wavelength_um, wavenumber_cm1, total_alpha = selected_total_alpha(serialized_result, list(visible_set))
+    x_values = wavenumber_cm1 if x_unit == "cm-1" else wavelength_um
+    try:
+        probe_index = nearest_index(x_values, float(x_value))
+    except Exception:
+        return None
+    peak = detect_peak_region(x_values, total_alpha, probe_index)
+    if not peak:
+        return None
+
+    preferred_gas = preferred_gas_from_interaction_point(point, result, visible_set)
+    return annotate_peak_metadata(result, visible_set, peak, preferred_gas)
+
+
+def interaction_x_value(point: dict[str, Any], x_unit: str) -> float | None:
+    x_value = point.get("x")
+    if x_value not in (None, ""):
+        try:
+            return float(x_value)
+        except Exception:
+            return None
+
+    customdata = point.get("customdata")
+    if isinstance(customdata, (list, tuple)):
+        try:
+            if x_unit == "cm-1" and len(customdata) > 1:
+                return float(customdata[1])
+            if x_unit != "cm-1" and len(customdata) > 0:
+                return float(customdata[0]) / 1000.0
+        except Exception:
+            return None
+    return None
+
+
+def preferred_gas_from_interaction_point(
+    point: dict[str, Any],
+    result: ManualSpectrumResult,
+    visible_set: set[str],
+) -> str | None:
+    curve_number = point.get("curveNumber")
+    if not isinstance(curve_number, (int, float)):
+        return None
+    gas_traces = [gas for gas in result.components.keys() if gas in visible_set]
+    curve_index = int(curve_number)
+    if curve_index < 0 or curve_index >= len(gas_traces):
+        return None
+    return gas_traces[curve_index]
+
+
+def annotate_peak_metadata(
+    result: ManualSpectrumResult,
+    visible_set: set[str],
+    peak: dict[str, Any],
+    preferred_gas: str | None = None,
+) -> dict[str, Any]:
+    left_index = int(peak["left"])
+    right_index = int(peak["right"])
+    apex_index = int(peak["apex"])
+    dominant_gas = ""
+    dominant_delta_alpha = -np.inf
+    dominant_alpha = -np.inf
+    dominant_concentration_ppbv = float("nan")
+    concentration_by_gas_ppbv: dict[str, float] = {}
+    for gas in visible_set:
+        component = result.components[gas]
+        current_alpha = float(component.alpha_per_cm[apex_index])
+        baseline_alpha = float(
+            np.interp(
+                apex_index,
+                [left_index, right_index],
+                [component.alpha_per_cm[left_index], component.alpha_per_cm[right_index]],
+            )
+        )
+        current_delta_alpha = max(current_alpha - baseline_alpha, 0.0)
+        concentration_by_gas_ppbv[gas] = float(component.concentration) * 1.0e9
+        if current_delta_alpha > dominant_delta_alpha:
+            dominant_delta_alpha = current_delta_alpha
+            dominant_alpha = current_alpha
+            dominant_gas = gas
+
+    if preferred_gas and preferred_gas in concentration_by_gas_ppbv:
+        dominant_gas = preferred_gas
+        dominant_concentration_ppbv = concentration_by_gas_ppbv[preferred_gas]
+    else:
+        if not dominant_gas:
+            for gas in visible_set:
+                component = result.components[gas]
+                current_alpha = float(component.alpha_per_cm[apex_index])
+                if current_alpha > dominant_alpha:
+                    dominant_alpha = current_alpha
+                    dominant_gas = gas
+        dominant_concentration_ppbv = concentration_by_gas_ppbv.get(dominant_gas, float("nan"))
+
+    peak["dominant_gas"] = dominant_gas
+    peak["dominant_concentration_ppbv"] = (
+        float(dominant_concentration_ppbv) if np.isfinite(dominant_concentration_ppbv) and dominant_concentration_ppbv > 0 else float("nan")
+    )
+    return peak
+
+
+def peak_from_x_window(
+    relayout_data: dict[str, Any] | None,
+    serialized_result: dict[str, Any] | None,
+    visible_gases: list[str] | None,
+    x_unit: str,
+) -> dict[str, Any] | None:
+    if not relayout_data or not serialized_result:
+        return None
+    x_range = extract_axis_range(relayout_data, "xaxis")
+    if not x_range or len(x_range) != 2:
+        return None
+
+    return peak_from_x_bounds(float(x_range[0]), float(x_range[1]), serialized_result, visible_gases, x_unit)
+
+
+def peak_from_x_bounds(
+    x_start: float,
+    x_end: float,
+    serialized_result: dict[str, Any] | None,
+    visible_gases: list[str] | None,
+    x_unit: str,
+) -> dict[str, Any] | None:
+    if not serialized_result:
+        return None
+
+    result = deserialize_manual_result(serialized_result)
+    visible_set = {
+        gas
+        for gas in (visible_gases or list(result.components.keys()))
+        if gas in result.components
+    }
+    if not visible_set:
+        visible_set = set(result.components.keys())
+
+    wavelength_um, wavenumber_cm1, total_alpha = selected_total_alpha(serialized_result, list(visible_set))
+    x_values = wavenumber_cm1 if x_unit == "cm-1" else wavelength_um
+    lower = min(float(x_start), float(x_end))
+    upper = max(float(x_start), float(x_end))
+    mask = (x_values >= lower) & (x_values <= upper)
+    if int(np.count_nonzero(mask)) < 4:
+        return None
+    in_window_indices = np.flatnonzero(mask)
+    local_maxima = local_maxima_indices(total_alpha)
+    local_maxima_in_window = local_maxima[mask[local_maxima]] if local_maxima.size else np.asarray([], dtype=int)
+
+    # Prefer true local maxima inside the selected bounds to avoid monotonic background trends.
+    if local_maxima_in_window.size:
+        probe_index = int(local_maxima_in_window[np.argmax(total_alpha[local_maxima_in_window])])
+    else:
+        return None
+    peak = detect_peak_region(x_values, total_alpha, probe_index)
+    if not peak:
+        return None
+
+    peak_left_x = float(x_values[int(peak["left"])])
+    peak_right_x = float(x_values[int(peak["right"])])
+    if max(peak_left_x, peak_right_x) < lower or min(peak_left_x, peak_right_x) > upper:
+        return None
+    return annotate_peak_metadata(result, visible_set, peak)
+
+
+def format_pas_delta_alpha(value: float) -> str:
+    return f"{float(value):.1E}"
+
+
+def format_pas_lod(delta_alpha_min: float, selected_peak: dict[str, Any] | None) -> str:
+    if not selected_peak:
+        return ""
+    delta_alpha_peak = float(selected_peak.get("delta_alpha", 0.0))
+    if not np.isfinite(delta_alpha_peak) or delta_alpha_peak <= 0.0:
+        return ""
+    simulated_concentration_ppbv = float(selected_peak.get("dominant_concentration_ppbv", float("nan")))
+    if np.isfinite(simulated_concentration_ppbv) and simulated_concentration_ppbv > 0.0:
+        lod_ppbv = simulated_concentration_ppbv * float(delta_alpha_min) / delta_alpha_peak
+    else:
+        lod_ppbv = PAS_REFERENCE_CONCENTRATION_PPBV * float(delta_alpha_min) / delta_alpha_peak
+    return f"{lod_ppbv:.3g}"
+
+
+def add_pas_overlay_traces(
+    figure: go.Figure,
+    x_values: np.ndarray,
+    total_y: np.ndarray,
+    peak: dict[str, Any] | None,
+    log_y: bool,
+    log_floor_value: float,
+    *,
+    color: str,
+    fill_color: str | None,
+    line_width: float,
+) -> None:
+    if not peak:
+        return
+    left = int(peak.get("left", -1))
+    right = int(peak.get("right", -1))
+    apex = int(peak.get("apex", -1))
+    if left < 0 or right >= len(total_y) or left >= right or apex < left or apex > right:
+        return
+
+    indices = np.arange(left, right + 1, dtype=int)
+    baseline = np.interp(indices, [left, right], [total_y[left], total_y[right]])
+    peak_segment = np.asarray(total_y[indices], dtype=float)
+    if log_y:
+        baseline_plot = baseline.clip(min=log_floor_value)
+        peak_plot = np.maximum(peak_segment, baseline).clip(min=log_floor_value)
+    else:
+        baseline_plot = baseline
+        peak_plot = np.maximum(peak_segment, baseline)
+
+    figure.add_trace(
+        go.Scatter(
+            x=x_values[indices],
+            y=baseline_plot,
+            mode="lines",
+            line={"color": color, "width": 1.3, "dash": "dot"},
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=x_values[indices],
+            y=peak_plot,
+            mode="lines",
+            line={"color": color, "width": line_width},
+            fill="tonexty" if fill_color else None,
+            fillcolor=fill_color,
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+
 def concentration_row(prefix: str, gas: str, value: float, unit: str, visible: bool = True) -> html.Div:
     color = GAS_LIBRARY[gas].get("plot_color", GAS_LIBRARY[gas]["color"])
     return html.Div(
@@ -471,6 +903,80 @@ def controls_section(title: str, description: str, children: list[Any]) -> html.
     return html.Div(
         className="panel-section",
         children=content,
+    )
+
+
+def pas_lod_controls(prefix: str) -> html.Div:
+    return html.Div(
+        className="pas-lod-panel",
+        children=[
+            html.Div(
+                className="pas-lod-top-row",
+                children=[
+                    html.Button("PAS LoD Berechnung WM", id=f"{prefix}-pas-arm", className="secondary-button pas-lod-button"),
+                    html.Span(id=f"{prefix}-pas-prompt", className="pas-lod-prompt"),
+                ],
+            ),
+            html.Div(
+                className="pas-lod-grid",
+                children=[
+                    parameter_field(
+                        "3 σ [nV]",
+                        dcc.Input(
+                            id=f"{prefix}-pas-3sigma",
+                            type="number",
+                            value=PAS_REFERENCE_SIGMA_NV,
+                            className="number-input",
+                            debounce=False,
+                        ),
+                    ),
+                    parameter_field(
+                        html.Span(["P", html.Sub("opt"), " [mW]"]),
+                        dcc.Input(
+                            id=f"{prefix}-pas-popt",
+                            type="number",
+                            value=PAS_REFERENCE_POPT_MW,
+                            className="number-input",
+                            debounce=False,
+                        ),
+                    ),
+                    parameter_field(
+                        "ε",
+                        dcc.Input(
+                            id=f"{prefix}-pas-eps",
+                            type="number",
+                            value=PAS_REFERENCE_EPS,
+                            min=0,
+                            max=1,
+                            step="any",
+                            className="number-input",
+                            debounce=False,
+                        ),
+                    ),
+                    parameter_field(
+                        html.Span(["Δα", html.Sub("min"), " [cm⁻¹]"]),
+                        dcc.Input(
+                            id=f"{prefix}-pas-delta-alpha-min",
+                            type="text",
+                            value="1.8E-7",
+                            readOnly=True,
+                            className="number-input",
+                        ),
+                    ),
+                    parameter_field(
+                        "LoD [ppbV]",
+                        dcc.Input(
+                            id=f"{prefix}-pas-lod",
+                            type="text",
+                            value="",
+                            readOnly=True,
+                            className="number-input",
+                        ),
+                    ),
+                ],
+            ),
+            dcc.Store(id=f"{prefix}-pas-state", data={"armed": False, "signature": "empty", "selected": None, "hover": None}),
+        ],
     )
 
 
@@ -823,6 +1329,7 @@ def make_spectrum_figure(
     revision_key: str | None = None,
     preserve_ui_state: bool = True,
     visible_gases: list[str] | None = None,
+    pas_state: dict[str, Any] | None = None,
 ) -> go.Figure:
     result = deserialize_manual_result(serialized_result)
     visible_set = {
@@ -883,12 +1390,36 @@ def make_spectrum_figure(
             customdata=customdata,
             mode="lines",
             name="Einhüllende",
-            line={"color": "#6b7280", "width": 1.4, "dash": "dash"},
+            line={"color": "#000000", "width": 1.2, "dash": "1px,2px"},
             hoverinfo="skip",
             hovertemplate=None,
             showlegend=False,
         )
     )
+
+    if pas_state:
+        add_pas_overlay_traces(
+            figure,
+            x_values,
+            total_y,
+            pas_state.get("hover"),
+            log_y,
+            log_floor_value,
+            color="rgba(220, 38, 38, 0.92)",
+            fill_color=None,
+            line_width=2.0,
+        )
+        add_pas_overlay_traces(
+            figure,
+            x_values,
+            total_y,
+            pas_state.get("selected"),
+            log_y,
+            log_floor_value,
+            color="rgba(220, 38, 38, 0.98)",
+            fill_color="rgba(220, 38, 38, 0.24)",
+            line_width=2.2,
+        )
 
     figure.add_trace(
         go.Scatter(
@@ -963,6 +1494,8 @@ def make_spectrum_figure(
         },
         font={"family": BODY_FONT, "size": 14, "color": "#1f2937"},
         hovermode="x unified",
+        clickmode="event+select",
+        dragmode="zoom",
         hoverdistance=-1,
         spikedistance=-1,
         showlegend=False,
@@ -1454,6 +1987,21 @@ app.layout = html.Div(
                     className="offline-mode-toggle",
                 ),
                 html.Span(id="offline-mode-meta", className="offline-mode-meta"),
+                html.Div(
+                    className="offline-cache-picker",
+                    children=[
+                        html.Span("Berechnungscache", className="field-label"),
+                        dcc.Dropdown(
+                            id="manual-offline-candidate",
+                            options=[],
+                            value=None,
+                            placeholder="Gespeicherte Spektren für aktuelle Gaswahl/Bereich",
+                            clearable=True,
+                            className="mini-dropdown",
+                        ),
+                        html.Span(id="manual-offline-candidate-meta", className="offline-mode-meta"),
+                    ],
+                ),
             ],
         ),
         dcc.Tabs(
@@ -1482,14 +2030,16 @@ app.layout = html.Div(
                                                         html.Div("Bitte warten...", id="manual-run-fetch-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
                                                     ],
                                                 ),
+                                                html.Button("Berechnung abbrechen", id="manual-cancel", className="secondary-button", disabled=True),
                                                 dcc.Checklist(
                                                     id="manual-auto-update",
                                                     options=[{"label": "Auto-Update", "value": "auto"}],
                                                     value=["auto"],
                                                     inline=True,
+                                                    persistence=True,
+                                                    persistence_type="local",
                                                     className="manual-auto-update-toggle",
                                                 ),
-                                                html.Div(id="manual-status", className="status-box"),
                                             ],
                                         ),
                                         html.Div(
@@ -1504,6 +2054,8 @@ app.layout = html.Div(
                                                             options=gas_options(),
                                                             value=DEFAULT_MANUAL_GASES,
                                                             multi=True,
+                                                            maxHeight=520,
+                                                            optionHeight=38,
                                                             persistence=True,
                                                             persistence_type="local",
                                                             className="main-dropdown",
@@ -1532,11 +2084,27 @@ app.layout = html.Div(
                                                             children=[
                                                                 parameter_field(
                                                                     "T [°C]",
-                                                                    dcc.Input(id="manual-temperature", type="number", value=35.0, className="number-input", placeholder="35.0"),
+                                                                    dcc.Input(
+                                                                        id="manual-temperature",
+                                                                        type="number",
+                                                                        value=35.0,
+                                                                        className="number-input",
+                                                                        placeholder="35.0",
+                                                                        persistence=True,
+                                                                        persistence_type="local",
+                                                                    ),
                                                                 ),
                                                                 parameter_field(
                                                                     "p [hPa]",
-                                                                    dcc.Input(id="manual-pressure", type="number", value=1035.0, className="number-input", placeholder="1035.0"),
+                                                                    dcc.Input(
+                                                                        id="manual-pressure",
+                                                                        type="number",
+                                                                        value=1035.0,
+                                                                        className="number-input",
+                                                                        placeholder="1035.0",
+                                                                        persistence=True,
+                                                                        persistence_type="local",
+                                                                    ),
                                                                 ),
                                                                 parameter_field(
                                                                     "Bereichseinheit",
@@ -1548,20 +2116,49 @@ app.layout = html.Div(
                                                                         ],
                                                                         value="um",
                                                                         clearable=False,
+                                                                        persistence=True,
+                                                                        persistence_type="local",
                                                                         className="main-dropdown",
                                                                     ),
                                                                 ),
                                                                 parameter_field(
                                                                     "Schrittweite [cm⁻¹]",
-                                                                    dcc.Input(id="manual-step", type="number", value=0.01, step="any", min=0, inputMode="decimal", className="number-input", placeholder="0.01"),
+                                                                    dcc.Input(
+                                                                        id="manual-step",
+                                                                        type="number",
+                                                                        value=0.01,
+                                                                        step="any",
+                                                                        min=0,
+                                                                        inputMode="decimal",
+                                                                        className="number-input",
+                                                                        placeholder="0.01",
+                                                                        persistence=True,
+                                                                        persistence_type="local",
+                                                                    ),
                                                                 ),
                                                                 parameter_field(
                                                                     html.Span("λ Minimum [µm]", id="manual-range-min-label"),
-                                                                    dcc.Input(id="manual-range-min", type="number", value=3.22, className="number-input", placeholder="3.22"),
+                                                                    dcc.Input(
+                                                                        id="manual-range-min",
+                                                                        type="number",
+                                                                        value=3.22,
+                                                                        className="number-input",
+                                                                        placeholder="3.22",
+                                                                        persistence=True,
+                                                                        persistence_type="local",
+                                                                    ),
                                                                 ),
                                                                 parameter_field(
                                                                     html.Span("λ Maximum [µm]", id="manual-range-max-label"),
-                                                                    dcc.Input(id="manual-range-max", type="number", value=3.24, className="number-input", placeholder="3.24"),
+                                                                    dcc.Input(
+                                                                        id="manual-range-max",
+                                                                        type="number",
+                                                                        value=3.24,
+                                                                        className="number-input",
+                                                                        placeholder="3.24",
+                                                                        persistence=True,
+                                                                        persistence_type="local",
+                                                                    ),
                                                                 ),
                                                             ],
                                                         ),
@@ -1576,12 +2173,16 @@ app.layout = html.Div(
                                                                     ],
                                                                     value="alpha",
                                                                     inline=True,
+                                                                    persistence=True,
+                                                                    persistence_type="local",
                                                                 ),
                                                                 dcc.Checklist(
                                                                     id="manual-log-scale",
                                                                     options=[{"label": "Log y", "value": "log"}],
                                                                     value=[],
                                                                     inline=True,
+                                                                    persistence=True,
+                                                                    persistence_type="local",
                                                                 ),
                                                                 html.Div(
                                                                     className="log-level-wrap",
@@ -1595,6 +2196,8 @@ app.layout = html.Div(
                                                                             value=5,
                                                                             marks={level: str(level) for level in range(1, 6)},
                                                                             included=False,
+                                                                            persistence=True,
+                                                                            persistence_type="local",
                                                                         ),
                                                                     ],
                                                                 ),
@@ -1602,6 +2205,8 @@ app.layout = html.Div(
                                                                     id="manual-visible-gases",
                                                                     options=[],
                                                                     value=[],
+                                                                    persistence=True,
+                                                                    persistence_type="local",
                                                                     className="component-visibility-checklist",
                                                                 ),
                                                             ],
@@ -1614,6 +2219,7 @@ app.layout = html.Div(
                                                 ),
                                             ],
                                         ),
+                                        html.Div(id="manual-status", className="status-box sidebar-status-box"),
                                         html.Div(
                                             className="sidebar-actions",
                                             children=[
@@ -1660,9 +2266,11 @@ app.layout = html.Div(
                                                 html.Div(id="manual-hover-panel", className="manual-hover-panel", children=hover_panel(None)),
                                             ],
                                         ),
+                                        pas_lod_controls("manual"),
                                         html.Div(id="manual-source-info", children=source_details_panel(None, None, "um")),
                                         dcc.Store(id="manual-spectrum-store"),
-                                        dcc.Store(id="manual-range-unit-store", data="um"),
+                                        dcc.Store(id="manual-range-unit-store", data="um", storage_type="local"),
+                                        dcc.Store(id="manual-cancel-store", data=0),
                                         dcc.Download(id="manual-export-download"),
                                         dcc.ConfirmDialog(id="hitran-update-dialog"),
                                         dcc.Interval(id="startup-hitran-check", interval=400, n_intervals=0, max_intervals=1),
@@ -1696,6 +2304,8 @@ app.layout = html.Div(
                                                             options=gas_options(),
                                                             value=DEFAULT_TARGET_GASES,
                                                             multi=True,
+                                                            maxHeight=520,
+                                                            optionHeight=38,
                                                             persistence=True,
                                                             persistence_type="local",
                                                             className="main-dropdown",
@@ -1724,6 +2334,8 @@ app.layout = html.Div(
                                                             options=gas_options(),
                                                             value=DEFAULT_INTERFERENCE_GASES,
                                                             multi=True,
+                                                            maxHeight=520,
+                                                            optionHeight=38,
                                                             persistence=True,
                                                             persistence_type="local",
                                                             className="main-dropdown",
@@ -1888,6 +2500,7 @@ app.layout = html.Div(
                                                             className="main-graph",
                                                             clear_on_unhover=False,
                                                         ),
+                                                        pas_lod_controls("search"),
                                                         html.Div(id="search-source-info", children=source_details_panel(None, None, "um")),
                                                         html.Div(
                                                             id="search-window-figures",
@@ -1965,6 +2578,107 @@ def sync_manual_range_inputs(
 
 
 @app.callback(
+    Output("manual-offline-candidate", "options"),
+    Output("manual-offline-candidate", "value"),
+    Output("manual-offline-candidate-meta", "children"),
+    Input("manual-gases", "value"),
+    Input("manual-range-unit", "value"),
+    Input("manual-range-min", "value"),
+    Input("manual-range-max", "value"),
+    Input("manual-spectrum-store", "data"),
+    State("manual-offline-candidate", "value"),
+)
+def refresh_manual_cache_options(
+    selected_gases: list[str] | None,
+    range_unit: str,
+    range_min: float | None,
+    range_max: float | None,
+    _spectrum: dict[str, Any] | None,
+    current_value: str | None,
+) -> tuple[list[dict[str, str]], str | None, str]:
+    if not selected_gases or range_min in (None, "") or range_max in (None, ""):
+        return [], None, ""
+    try:
+        entries = list_manual_result_snapshots(
+            tuple(sorted(set(selected_gases))),
+            str(range_unit),
+            float(range_min),
+            float(range_max),
+        )
+    except Exception:
+        return [], None, ""
+
+    options = [{"label": manual_cache_option_label(entry), "value": str(entry["id"])} for entry in entries]
+    valid_values = {str(item["value"]) for item in options}
+    retained_value = current_value if current_value in valid_values else None
+    meta = f"{len(options)} gespeicherte Berechnungen gefunden" if options else "Keine gespeicherte Berechnung für aktuelle Gaswahl/Bereich"
+    return options, retained_value, meta
+
+
+@app.callback(
+    Output("manual-spectrum-store", "data", allow_duplicate=True),
+    Output("manual-status", "children", allow_duplicate=True),
+    Output("offline-mode", "value", allow_duplicate=True),
+    Output("manual-temperature", "value", allow_duplicate=True),
+    Output("manual-pressure", "value", allow_duplicate=True),
+    Output("manual-step", "value", allow_duplicate=True),
+    Output("manual-gases", "value", allow_duplicate=True),
+    *[Output(f"manual-concentration-value-{gas}", "value", allow_duplicate=True) for gas in ALL_GASES],
+    *[Output(f"manual-concentration-unit-{gas}", "value", allow_duplicate=True) for gas in ALL_GASES],
+    Input("manual-offline-candidate", "value"),
+    State("offline-mode", "value"),
+    prevent_initial_call=True,
+)
+def load_manual_cache_candidate(
+    snapshot_id: str | None,
+    offline_selection: list[str] | None,
+) -> tuple[Any, ...]:
+    if not snapshot_id:
+        raise PreventUpdate
+    payload = load_manual_result_snapshot(snapshot_id)
+    if not payload:
+        raise PreventUpdate
+
+    selected = list(offline_selection or [])
+    if OFFLINE_DB_MODE not in selected:
+        selected.append(OFFLINE_DB_MODE)
+    payload = dict(payload)
+    payload["render_revision"] = int(time.time() * 1000)
+    temperature_value = payload.get("temperature_c", dash.no_update)
+    pressure_value = payload.get("pressure_hpa", dash.no_update)
+    step_value = payload.get("step_cm1", dash.no_update)
+
+    components = payload.get("components", {}) if isinstance(payload.get("components", {}), dict) else {}
+    selected_gases = [gas for gas in ALL_GASES if gas in components]
+
+    concentration_values: list[float] = []
+    concentration_units: list[str] = []
+    for gas in ALL_GASES:
+        component_payload = components.get(gas)
+        if isinstance(component_payload, dict):
+            try:
+                value, unit = molar_fraction_to_value_unit(float(component_payload.get("concentration", 0.0)))
+            except Exception:
+                value, unit = default_concentration_for(gas, DEFAULT_MANUAL_CONCENTRATIONS)
+        else:
+            value, unit = default_concentration_for(gas, DEFAULT_MANUAL_CONCENTRATIONS)
+        concentration_values.append(float(value))
+        concentration_units.append(str(unit))
+
+    return (
+        payload,
+        "Spektrum aus lokalem Berechnungscache geladen.",
+        selected,
+        temperature_value,
+        pressure_value,
+        step_value,
+        selected_gases,
+        *concentration_values,
+        *concentration_units,
+    )
+
+
+@app.callback(
     Output("offline-mode", "options"),
     Output("offline-mode-meta", "children"),
     Output("offline-mode", "value"),
@@ -2028,8 +2742,22 @@ def sync_search_range_inputs(
 
 
 @app.callback(
+    Output("manual-cancel-store", "data"),
+    Input("manual-cancel", "n_clicks"),
+    State("manual-cancel-store", "data"),
+    prevent_initial_call=True,
+)
+def cancel_manual_run(n_clicks: int | None, token: int | None) -> int:
+    if not n_clicks:
+        raise PreventUpdate
+    MANUAL_CANCEL_EVENT.set()
+    return int(token or 0) + 1
+
+
+@app.callback(
     Output("manual-spectrum-store", "data"),
     Output("manual-status", "children"),
+    Output("offline-mode", "value", allow_duplicate=True),
     Input("manual-run", "n_clicks"),
     Input("manual-auto-update", "value"),
     Input("manual-gases", "value"),
@@ -2040,10 +2768,13 @@ def sync_search_range_inputs(
     Input("manual-temperature", "value"),
     Input("manual-pressure", "value"),
     Input("offline-mode", "value"),
+    Input("manual-cancel-store", "data"),
     *MANUAL_CONCENTRATION_INPUTS,
+    State("manual-spectrum-store", "data"),
     running=[
         (Output("manual-run", "disabled"), True, False),
         (Output("manual-run", "children"), "Spektrum wird berechnet...", "Spektrum berechnen"),
+        (Output("manual-cancel", "disabled"), False, True),
         (Output("manual-fetch-manual-lock", "style"), BUTTON_LOCK_VISIBLE, BUTTON_LOCK_HIDDEN),
     ],
     prevent_initial_call=True,
@@ -2059,39 +2790,120 @@ def update_manual_spectrum(
     temperature_c: float,
     pressure_hpa: float,
     offline_selection: list[str] | None,
+    _cancel_token: int,
     *concentration_state_values: Any,
-) -> tuple[dict[str, Any] | None, str]:
-    data_source = OFFLINE_DB_MODE if offline_mode_enabled(offline_selection) else LIVE_DB_MODE
+) -> tuple[dict[str, Any] | None, str, list[str]]:
+    previous_serialized = concentration_state_values[-1] if concentration_state_values else None
+    concentration_state_values = concentration_state_values[:-1]
     trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
     if trigger_id is None and dash.callback_context.triggered:
         trigger_id = str(dash.callback_context.triggered[0].get("prop_id", "")).split(".", 1)[0]
+    if trigger_id == "manual-cancel-store":
+        raise PreventUpdate
+
+    MANUAL_CANCEL_EVENT.clear()
+    data_source = OFFLINE_DB_MODE if offline_mode_enabled(offline_selection) else LIVE_DB_MODE
     auto_update_enabled = "auto" in (auto_update_selection or [])
     if not auto_update_enabled and trigger_id != "manual-run":
         raise PreventUpdate
+
+    if trigger_id in {"manual-range-unit", "manual-range-min", "manual-range-max"} and previous_serialized:
+        try:
+            previous_result = deserialize_manual_result(previous_serialized)
+            requested_min_um, requested_max_um = normalize_wavelength_window(
+                range_unit,
+                parse_required_number(range_min, "Minimum"),
+                parse_required_number(range_max, "Maximum"),
+            )
+            prev_min_um = float(np.min(previous_result.wavelength_um))
+            prev_max_um = float(np.max(previous_result.wavelength_um))
+            tolerance = 2.5e-6
+            if abs(requested_min_um - prev_min_um) <= tolerance and abs(requested_max_um - prev_max_um) <= tolerance:
+                raise PreventUpdate
+        except PreventUpdate:
+            raise
+        except Exception:
+            pass
+
     try:
         if not selected_gases:
             raise ValueError("Bitte mindestens ein Gas auswaehlen.")
         gas_values = list(concentration_state_values[: len(ALL_GASES)])
         gas_units = list(concentration_state_values[len(ALL_GASES) :])
+        gas_tuple = tuple(sorted(set(selected_gases)))
         concentrations = collect_concentrations(gas_values, gas_units, selected_gases)
         parsed_range_min = parse_required_number(range_min, "Minimum")
         parsed_range_max = parse_required_number(range_max, "Maximum")
+        parsed_temperature = parse_required_number(temperature_c, "T [°C]")
+        parsed_pressure = parse_required_number(pressure_hpa, "p [hPa]")
+        requested_step = parse_required_number(step_cm1, "Schrittweite [cm⁻¹]")
+
+        if data_source == LIVE_DB_MODE:
+            cached_payload = load_matching_manual_result_snapshot(
+                gases=gas_tuple,
+                range_unit=range_unit,
+                range_min=parsed_range_min,
+                range_max=parsed_range_max,
+                temperature_c=parsed_temperature,
+                pressure_hpa=parsed_pressure,
+                step_cm1=requested_step,
+                concentrations=concentrations,
+            )
+            if cached_payload:
+                cached_serialized = dict(cached_payload)
+                cached_serialized["render_revision"] = int(_n_clicks or 0)
+                cached_serialized["display_range_unit"] = range_unit
+                selected = list(offline_selection or [])
+                if OFFLINE_DB_MODE not in selected:
+                    selected.append(OFFLINE_DB_MODE)
+                return (
+                    cached_serialized,
+                    "Spektrum vollständig aus lokalem Berechnungscache geladen (exakter Match für Gase/Bereich/T/p/Schrittweite/Konzentrationen).",
+                    selected,
+                )
+
+        spectrum_span = abs(normalize_wavenumber_window(range_unit, parsed_range_min, parsed_range_max)[1] - normalize_wavenumber_window(range_unit, parsed_range_min, parsed_range_max)[0])
+        is_auto_preview = trigger_id != "manual-run"
+        effective_step = requested_step
+        if is_auto_preview:
+            preview_step = max(requested_step, spectrum_span / 3200.0, 0.02)
+            effective_step = preview_step
+
+        t0 = time.perf_counter()
         manual_result = build_manual_spectrum(
             concentrations=concentrations,
-            temperature_c=parse_required_number(temperature_c, "T [°C]"),
-            pressure_hpa=parse_required_number(pressure_hpa, "p [hPa]"),
+            temperature_c=parsed_temperature,
+            pressure_hpa=parsed_pressure,
             range_unit=range_unit,
             range_min=parsed_range_min,
             range_max=parsed_range_max,
-            step_cm1=parse_required_number(step_cm1, "Schrittweite [cm⁻¹]"),
+            step_cm1=effective_step,
             data_source=data_source,
+            cancel_event=MANUAL_CANCEL_EVENT,
         )
+        t1 = time.perf_counter()
         sampled_result = downsample_manual_result(manual_result)
         serialized = serialize_manual_result(sampled_result)
         serialized["render_revision"] = int(_n_clicks or 0)
         serialized["display_range_unit"] = range_unit
+        t2 = time.perf_counter()
+
+        if not is_auto_preview:
+            save_manual_result_snapshot(
+                serialized_result=serialized,
+                gases=gas_tuple,
+                range_unit=range_unit,
+                range_min=parsed_range_min,
+                range_max=parsed_range_max,
+                temperature_c=manual_result.temperature_c,
+                pressure_hpa=manual_result.pressure_hpa,
+                step_cm1=manual_result.step_cm1,
+                concentrations=concentrations,
+            )
+
         span_cm1 = abs(sampled_result.wavenumber_cm1.max() - sampled_result.wavenumber_cm1.min())
         suggested_step = recommended_step_cm1(span_cm1, manual_mode=True)
+        runtime_note = f" Laufzeit: Build {t1 - t0:.2f}s | RenderPrep {t2 - t1:.2f}s."
         if data_source == OFFLINE_DB_MODE:
             status = (
                 f"{len(sampled_result.components)} Komponenten geladen, {len(sampled_result.wavelength_um)} Plotpunkte. "
@@ -2103,10 +2915,17 @@ def update_manual_spectrum(
                 f"Wenn ein größerer Bereich langsam wird, ist für diese Spannweite etwa {suggested_step:.4f} cm⁻¹ sinnvoll. "
                 "Quelle: lokale HAPI/HITRAN-DB."
             )
+        if is_auto_preview:
+            status = "Vorschau (Auto-Update): gröbere Schrittweite für schnelle Reaktion. Mit 'Spektrum berechnen' wird die volle Auflösung gerechnet. " + status
+        status += runtime_note
         status += coverage_gap_notice(manual_result, selected_gases, range_unit, "Fehlende Spektraldatenbereiche:")
-        return serialized, status
+        return serialized, status, list(offline_selection or [])
+    except InterruptedError:
+        if previous_serialized:
+            return previous_serialized, "Berechnung abgebrochen. Letztes Spektrum bleibt angezeigt.", list(offline_selection or [])
+        return None, "Berechnung abgebrochen.", list(offline_selection or [])
     except Exception as exc:
-        return None, format_data_source_error(exc, data_source, range_unit, range_min, range_max)
+        return None, format_data_source_error(exc, data_source, range_unit, range_min, range_max), list(offline_selection or [])
 
 
 @app.callback(
@@ -2131,8 +2950,10 @@ def sync_manual_visible_gases(
     Input("manual-log-scale", "value"),
     Input("manual-log-level", "value"),
     Input("manual-visible-gases", "value"),
+    Input("manual-pas-state", "data"),
     Input("manual-range-unit", "value"),
     Input("manual-graph", "relayoutData"),
+    State("manual-auto-update", "value"),
     State("manual-graph", "figure"),
 )
 def render_manual_spectrum(
@@ -2141,12 +2962,28 @@ def render_manual_spectrum(
     log_scale: list[str],
     log_level: int,
     visible_gases: list[str] | None,
+    pas_state: dict[str, Any] | None,
     range_unit: str,
     relayout_data: dict[str, Any] | None,
+    auto_update_selection: list[str] | None,
     current_figure: dict[str, Any] | None,
 ) -> tuple[go.Figure, html.Div]:
     if not serialized_result:
         return empty_figure("Spektrum wird nach der ersten Berechnung hier angezeigt."), source_details_panel(None, None, range_unit)
+
+    trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
+    if trigger_id is None and dash.callback_context.triggered:
+        trigger_id = str(dash.callback_context.triggered[0].get("prop_id", "")).split(".", 1)[0]
+    auto_update_enabled = "auto" in (auto_update_selection or [])
+    if not auto_update_enabled and trigger_id in {
+        "manual-y-mode",
+        "manual-log-scale",
+        "manual-log-level",
+        "manual-visible-gases",
+        "manual-range-unit",
+    }:
+        raise PreventUpdate
+
     log_y = "log" in (log_scale or [])
     x_range, y_range = preserve_manual_ranges(
         current_figure,
@@ -2166,8 +3003,153 @@ def render_manual_spectrum(
         x_range=x_range,
         y_range=y_range,
         visible_gases=visible_gases,
+        pas_state=pas_state if y_mode == "alpha" else None,
     )
     return figure, source_details_panel(serialized_result, visible_gases, range_unit)
+
+
+@app.callback(
+    Output("manual-pas-state", "data"),
+    Output("manual-pas-delta-alpha-min", "value"),
+    Output("manual-pas-lod", "value"),
+    Output("manual-pas-prompt", "children"),
+    Output("manual-pas-eps", "value"),
+    Output("manual-graph", "style"),
+    Input("manual-pas-arm", "n_clicks"),
+    Input("manual-graph", "hoverData"),
+    Input("manual-graph", "clickData"),
+    Input("manual-graph", "relayoutData"),
+    Input("manual-spectrum-store", "data"),
+    Input("manual-y-mode", "value"),
+    Input("manual-range-unit", "value"),
+    Input("manual-visible-gases", "value"),
+    Input("manual-pas-3sigma", "value"),
+    Input("manual-pas-popt", "value"),
+    Input("manual-pas-eps", "value"),
+    State("manual-pas-state", "data"),
+)
+def update_manual_pas_lod(
+    _arm_clicks: int | None,
+    hover_data: dict[str, Any] | None,
+    click_data: dict[str, Any] | None,
+    relayout_data: dict[str, Any] | None,
+    serialized_result: dict[str, Any] | None,
+    y_mode: str,
+    range_unit: str,
+    visible_gases: list[str] | None,
+    sigma_3nv: float | None,
+    p_opt_mw: float | None,
+    eps_value: float | None,
+    current_state: dict[str, Any] | None,
+) -> tuple[dict[str, Any], str, str, str, float, dict[str, Any]]:
+    state = dict(current_state or {})
+    state.setdefault("armed", False)
+    state.setdefault("signature", "empty")
+    state.setdefault("selected", None)
+    state.setdefault("hover", None)
+    state.setdefault("pending_x", None)
+
+    eps_sanitized = sanitize_pas_eps(eps_value)
+    delta_alpha_min = compute_pas_delta_alpha_min(sigma_3nv, p_opt_mw, eps_sanitized)
+    trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
+    trigger_prop = ""
+    if dash.callback_context.triggered:
+        trigger_prop = str(dash.callback_context.triggered[0].get("prop_id", ""))
+    if trigger_id is None and trigger_prop:
+        trigger_id = trigger_prop.split(".", 1)[0]
+
+    if trigger_id == "manual-graph" and not state.get("armed"):
+        raise PreventUpdate
+
+    if not serialized_result or y_mode != "alpha":
+        state = {"armed": False, "signature": "empty", "selected": None, "hover": None, "pending_x": None}
+        prompt = "PAS LoD nur bei Alpha-Ansicht verfügbar." if serialized_result else ""
+        return state, format_pas_delta_alpha(delta_alpha_min), "", prompt, eps_sanitized, {"cursor": "default"}
+
+    signature = pas_signature(serialized_result, visible_gases)
+    if state.get("signature") != signature:
+        state = {"armed": False, "signature": signature, "selected": None, "hover": None, "pending_x": None}
+    else:
+        state["signature"] = signature
+
+    if trigger_id == "manual-pas-arm":
+        state["armed"] = True
+        state["selected"] = None
+        state["hover"] = None
+        state["pending_x"] = None
+
+    if state.get("armed") and trigger_id == "manual-graph":
+        if trigger_prop.endswith("relayoutData") and relayout_has_explicit_x_range(relayout_data):
+            selected_peak = peak_from_x_window(relayout_data, serialized_result, visible_gases, range_unit)
+            if selected_peak:
+                state["selected"] = selected_peak
+                state["armed"] = False
+                state["pending_x"] = None
+            state["hover"] = None
+        elif trigger_prop.endswith("clickData") and click_data:
+            points = click_data.get("points") or []
+            point = points[0] if points else {}
+            click_x = interaction_x_value(point or {}, range_unit)
+            if click_x is not None and np.isfinite(click_x):
+                pending_x = state.get("pending_x")
+                if pending_x in (None, ""):
+                    state["pending_x"] = float(click_x)
+                    state["hover"] = peak_from_interaction(click_data, serialized_result, visible_gases, range_unit)
+                else:
+                    selected_peak = peak_from_x_bounds(float(pending_x), float(click_x), serialized_result, visible_gases, range_unit)
+                    if not selected_peak:
+                        selected_peak = peak_from_interaction(click_data, serialized_result, visible_gases, range_unit)
+                    if selected_peak:
+                        state["selected"] = selected_peak
+                        state["armed"] = False
+                    state["pending_x"] = None
+                    state["hover"] = None
+            else:
+                selected_peak = peak_from_interaction(click_data, serialized_result, visible_gases, range_unit)
+                if selected_peak:
+                    state["selected"] = selected_peak
+                    state["armed"] = False
+                    state["pending_x"] = None
+                state["hover"] = None
+        elif trigger_prop.endswith("hoverData"):
+            # Avoid continuous graph redraws while hovering; selection is click/drag only.
+            state["hover"] = None
+    elif not state.get("armed"):
+        state["hover"] = None
+        state["pending_x"] = None
+
+    lod_text = format_pas_lod(delta_alpha_min, state.get("selected"))
+    if state.get("armed"):
+        pending_x = state.get("pending_x")
+        if pending_x not in (None, "") and np.isfinite(float(pending_x)):
+            unit_label = "cm⁻¹" if range_unit == "cm-1" else "µm"
+            prompt = (
+                f"LoD-Auswahl aktiv: Start bei {float(pending_x):.4f} {unit_label} gesetzt. "
+                "Jetzt rechten Rand klicken oder Peakbereich mit linker Maustaste aufziehen."
+            )
+        else:
+            prompt = (
+                "LoD-Auswahl aktiv: Entweder Peakbereich mit linker Maustaste aufziehen "
+                "oder zwei Mal klicken (links/rechts)."
+            )
+    elif state.get("selected"):
+        selected_peak = state.get("selected") or {}
+        dominant_gas = str(selected_peak.get("dominant_gas", ""))
+        dominant_conc_ppbv = float(selected_peak.get("dominant_concentration_ppbv", float("nan")))
+        if dominant_gas and np.isfinite(dominant_conc_ppbv) and dominant_conc_ppbv > 0.0:
+            prompt = (
+                f"Peak gewählt: Δα = {float(selected_peak.get('delta_alpha', 0.0)):.3E} 1/cm "
+                f"| Gas {display_formula(dominant_gas)} bei {dominant_conc_ppbv:.3g} ppbV"
+            )
+        else:
+            prompt = f"Peak gewählt: Δα = {float(selected_peak.get('delta_alpha', 0.0)):.3E} 1/cm"
+    else:
+        if trigger_id == "manual-graph":
+            prompt = "Im gewählten Bereich wurde kein lokales Peak-Maximum im Summenspektrum gefunden. Bitte enger um den Zielpeak wählen."
+        else:
+            prompt = ""
+    graph_style = {"cursor": "crosshair"} if state.get("armed") else {"cursor": "default"}
+    return state, format_pas_delta_alpha(delta_alpha_min), lod_text, prompt, eps_sanitized, graph_style
 
 
 @app.callback(
@@ -2197,6 +3179,155 @@ def export_manual_spectrum_csv(
     )
     csv_content = build_manual_export_csv(serialized_result, range_unit, x_range)
     return dcc.send_string(csv_content, manual_export_filename(serialized_result))
+
+
+@app.callback(
+    Output("search-pas-state", "data"),
+    Output("search-pas-delta-alpha-min", "value"),
+    Output("search-pas-lod", "value"),
+    Output("search-pas-prompt", "children"),
+    Output("search-pas-eps", "value"),
+    Output("search-graph", "style"),
+    Input("search-pas-arm", "n_clicks"),
+    Input("search-graph", "hoverData"),
+    Input("search-graph", "clickData"),
+    Input("search-graph", "relayoutData"),
+    Input("search-selected-spectrum-store", "data"),
+    Input("search-store", "data"),
+    Input("search-range-unit", "value"),
+    Input("search-visible-gases", "value"),
+    Input("search-pas-3sigma", "value"),
+    Input("search-pas-popt", "value"),
+    Input("search-pas-eps", "value"),
+    State("search-pas-state", "data"),
+)
+def update_search_pas_lod(
+    _arm_clicks: int | None,
+    hover_data: dict[str, Any] | None,
+    click_data: dict[str, Any] | None,
+    relayout_data: dict[str, Any] | None,
+    selected_result_store: dict[str, Any] | None,
+    store: dict[str, Any] | None,
+    range_unit: str,
+    visible_gases: list[str] | None,
+    sigma_3nv: float | None,
+    p_opt_mw: float | None,
+    eps_value: float | None,
+    current_state: dict[str, Any] | None,
+) -> tuple[dict[str, Any], str, str, str, float, dict[str, Any]]:
+    serialized_result = None
+    if selected_result_store and selected_result_store.get("spectrum"):
+        serialized_result = selected_result_store.get("spectrum")
+    elif store and store.get("spectrum"):
+        serialized_result = store.get("spectrum")
+
+    state = dict(current_state or {})
+    state.setdefault("armed", False)
+    state.setdefault("signature", "empty")
+    state.setdefault("selected", None)
+    state.setdefault("hover", None)
+    state.setdefault("pending_x", None)
+
+    eps_sanitized = sanitize_pas_eps(eps_value)
+    delta_alpha_min = compute_pas_delta_alpha_min(sigma_3nv, p_opt_mw, eps_sanitized)
+    trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
+    trigger_prop = ""
+    if dash.callback_context.triggered:
+        trigger_prop = str(dash.callback_context.triggered[0].get("prop_id", ""))
+    if trigger_id is None and trigger_prop:
+        trigger_id = trigger_prop.split(".", 1)[0]
+
+    if trigger_id == "search-graph" and not state.get("armed"):
+        raise PreventUpdate
+
+    if not serialized_result:
+        state = {"armed": False, "signature": "empty", "selected": None, "hover": None, "pending_x": None}
+        return state, format_pas_delta_alpha(delta_alpha_min), "", "", eps_sanitized, {"cursor": "default"}
+
+    signature = pas_signature(serialized_result, visible_gases)
+    if state.get("signature") != signature:
+        state = {"armed": False, "signature": signature, "selected": None, "hover": None, "pending_x": None}
+    else:
+        state["signature"] = signature
+
+    if trigger_id == "search-pas-arm":
+        state["armed"] = True
+        state["selected"] = None
+        state["hover"] = None
+        state["pending_x"] = None
+
+    if state.get("armed") and trigger_id == "search-graph":
+        if trigger_prop.endswith("relayoutData") and relayout_has_explicit_x_range(relayout_data):
+            selected_peak = peak_from_x_window(relayout_data, serialized_result, visible_gases, range_unit)
+            if selected_peak:
+                state["selected"] = selected_peak
+                state["armed"] = False
+                state["pending_x"] = None
+            state["hover"] = None
+        elif trigger_prop.endswith("clickData") and click_data:
+            points = click_data.get("points") or []
+            point = points[0] if points else {}
+            click_x = interaction_x_value(point or {}, range_unit)
+            if click_x is not None and np.isfinite(click_x):
+                pending_x = state.get("pending_x")
+                if pending_x in (None, ""):
+                    state["pending_x"] = float(click_x)
+                    state["hover"] = peak_from_interaction(click_data, serialized_result, visible_gases, range_unit)
+                else:
+                    selected_peak = peak_from_x_bounds(float(pending_x), float(click_x), serialized_result, visible_gases, range_unit)
+                    if not selected_peak:
+                        selected_peak = peak_from_interaction(click_data, serialized_result, visible_gases, range_unit)
+                    if selected_peak:
+                        state["selected"] = selected_peak
+                        state["armed"] = False
+                    state["pending_x"] = None
+                    state["hover"] = None
+            else:
+                selected_peak = peak_from_interaction(click_data, serialized_result, visible_gases, range_unit)
+                if selected_peak:
+                    state["selected"] = selected_peak
+                    state["armed"] = False
+                    state["pending_x"] = None
+                state["hover"] = None
+        elif trigger_prop.endswith("hoverData"):
+            # Avoid continuous graph redraws while hovering; selection is click/drag only.
+            state["hover"] = None
+    elif not state.get("armed"):
+        state["hover"] = None
+        state["pending_x"] = None
+
+    lod_text = format_pas_lod(delta_alpha_min, state.get("selected"))
+    if state.get("armed"):
+        pending_x = state.get("pending_x")
+        if pending_x not in (None, "") and np.isfinite(float(pending_x)):
+            unit_label = "cm⁻¹" if range_unit == "cm-1" else "µm"
+            prompt = (
+                f"LoD-Auswahl aktiv: Start bei {float(pending_x):.4f} {unit_label} gesetzt. "
+                "Jetzt rechten Rand klicken oder Peakbereich mit linker Maustaste aufziehen."
+            )
+        else:
+            prompt = (
+                "LoD-Auswahl aktiv: Entweder Peakbereich mit linker Maustaste aufziehen "
+                "oder zwei Mal klicken (links/rechts)."
+            )
+    elif state.get("selected"):
+        selected_peak = state.get("selected") or {}
+        dominant_gas = str(selected_peak.get("dominant_gas", ""))
+        dominant_conc_ppbv = float(selected_peak.get("dominant_concentration_ppbv", float("nan")))
+        if dominant_gas and np.isfinite(dominant_conc_ppbv) and dominant_conc_ppbv > 0.0:
+            prompt = (
+                f"Peak gewählt: Δα = {float(selected_peak.get('delta_alpha', 0.0)):.3E} 1/cm "
+                f"| Gas {display_formula(dominant_gas)} bei {dominant_conc_ppbv:.3g} ppbV"
+            )
+        else:
+            prompt = f"Peak gewählt: Δα = {float(selected_peak.get('delta_alpha', 0.0)):.3E} 1/cm"
+    else:
+        if trigger_id == "search-graph":
+            prompt = "Im gewählten Bereich wurde kein lokales Peak-Maximum im Summenspektrum gefunden. Bitte enger um den Zielpeak wählen."
+        else:
+            prompt = ""
+    graph_style = {"cursor": "crosshair"} if state.get("armed") else {"cursor": "default"}
+    return state, format_pas_delta_alpha(delta_alpha_min), lod_text, prompt, eps_sanitized, graph_style
 
 
 @app.callback(
@@ -2443,6 +3574,7 @@ def sync_search_results_table(range_unit: str, store: dict[str, Any] | None) -> 
     Input("search-log-scale", "value"),
     Input("search-log-level", "value"),
     Input("search-visible-gases", "value"),
+    Input("search-pas-state", "data"),
     State("search-store", "data"),
     State("search-selected-spectrum-store", "data"),
 )
@@ -2452,6 +3584,7 @@ def update_search_plot(
     log_scale: list[str],
     log_level: int,
     visible_gases: list[str] | None,
+    pas_state: dict[str, Any] | None,
     store: dict[str, Any] | None,
     selected_result_store: dict[str, Any] | None,
 ) -> tuple[go.Figure, html.Div, html.Div, html.Div, dict[str, Any] | None]:
@@ -2467,12 +3600,12 @@ def update_search_plot(
     if row_index >= len(store["plans"]):
         row_index = 0
     plan = deserialize_laser_plan(store["plans"][row_index])
-    cache_key = "|".join([str(row_index), range_unit, *[window.window_id for window in plan.windows]])
+    cache_key = "|".join([str(row_index), *[window.window_id for window in plan.windows]])
     trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
     if trigger_id is None and dash.callback_context.triggered:
         trigger_id = str(dash.callback_context.triggered[0].get("prop_id", "")).split(".", 1)[0]
     can_reuse_cached_result = (
-        trigger_id in {"search-log-scale", "search-log-level", "search-visible-gases"}
+        trigger_id in {"search-log-scale", "search-log-level", "search-visible-gases", "search-range-unit", "search-pas-state"}
         and selected_result_store is not None
         and selected_result_store.get("cache_key") == cache_key
         and selected_result_store.get("spectrum") is not None
@@ -2538,6 +3671,7 @@ def update_search_plot(
         revision_key=plan_revision_key,
         preserve_ui_state=False,
         visible_gases=visible_gases,
+        pas_state=pas_state,
     )
     figure.update_layout(meta={**(figure.layout.meta or {}), "step_cm1": fine_step_cm1})
     serialized_result = selected_store_payload["spectrum"]

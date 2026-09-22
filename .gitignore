@@ -2,7 +2,11 @@ __pycache__/
 *.py[cod]
 
 hitran_cache/
+
+# Keep manual snapshot cache versioned, but exclude bulky offline PKL artifact.
 abscross_dict.pkl
+!user_spectrum_cache/
+!user_spectrum_cache/**
 
 __tmp_root.html
 

@@ -45,6 +45,8 @@ LEGACY_DATA_DIR = BASE_DIR / "data"
 DATA_DIR = BASE_DIR / "hitran_cache"
 XSC_CACHE_DIR = DATA_DIR / "xsc"
 OFFLINE_SPECTRA_PATH = BASE_DIR / "abscross_dict.pkl"
+USER_RESULT_CACHE_DIR = BASE_DIR / "user_spectrum_cache"
+USER_RESULT_INDEX_PATH = USER_RESULT_CACHE_DIR / "index.json"
 OFFLINE_DB_MODE = "offline"
 LIVE_DB_MODE = "live"
 
@@ -1721,7 +1723,11 @@ def build_manual_spectrum(
     range_max: float,
     step_cm1: float | None = None,
     data_source: str = LIVE_DB_MODE,
+    cancel_event: Any | None = None,
 ) -> ManualSpectrumResult:
+    if cancel_event is not None and bool(getattr(cancel_event, "is_set", lambda: False)()):
+        raise InterruptedError("Calculation canceled by user.")
+
     active_concentrations = {
         gas: value for gas, value in concentrations.items() if gas in GAS_LIBRARY and value > 0
     }
@@ -1752,6 +1758,10 @@ def build_manual_spectrum(
             round(nu_max, 6),
             round(effective_step, 6),
         )
+
+    if cancel_event is not None and bool(getattr(cancel_event, "is_set", lambda: False)()):
+        raise InterruptedError("Calculation canceled by user.")
+
     if data_source == OFFLINE_DB_MODE:
         offline_coverage_ranges = _load_offline_coverage_ranges()
         coverage_ranges_cm1_by_gas = {
@@ -1799,6 +1809,8 @@ def build_manual_spectrum(
     components: dict[str, ComponentSpectrum] = {}
 
     for gas in gas_tuple:
+        if cancel_event is not None and bool(getattr(cancel_event, "is_set", lambda: False)()):
+            raise InterruptedError("Calculation canceled by user.")
         sigma = np.asarray(sigma_map[gas], dtype=float)
         alpha = sigma * number_density * active_concentrations[gas]
         total_sigma += sigma
@@ -1867,6 +1879,171 @@ def serialize_manual_result(result: ManualSpectrumResult) -> dict[str, Any]:
         },
         "source_details_by_gas": result.source_details_by_gas,
     }
+
+
+def _ensure_user_cache_dir() -> None:
+    USER_RESULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _load_user_result_index() -> list[dict[str, Any]]:
+    if not USER_RESULT_INDEX_PATH.exists():
+        return []
+    try:
+        payload = json.loads(USER_RESULT_INDEX_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    entries = [entry for entry in payload if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
+    return entries
+
+
+def _save_user_result_index(entries: list[dict[str, Any]]) -> None:
+    _ensure_user_cache_dir()
+    USER_RESULT_INDEX_PATH.write_text(
+        json.dumps(entries, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _manual_cache_signature(gases: tuple[str, ...], nu_min: float, nu_max: float) -> str:
+    return f"{'/'.join(gases)}|{nu_min:.6f}|{nu_max:.6f}"
+
+
+def _manual_concentration_signature(concentrations: dict[str, float] | None) -> str:
+    if not concentrations:
+        return ""
+    parts = [
+        f"{gas}:{float(value):.12e}"
+        for gas, value in sorted(concentrations.items())
+        if gas in GAS_LIBRARY and float(value) > 0.0
+    ]
+    return "|".join(parts)
+
+
+def save_manual_result_snapshot(
+    serialized_result: dict[str, Any],
+    gases: tuple[str, ...],
+    range_unit: str,
+    range_min: float,
+    range_max: float,
+    temperature_c: float,
+    pressure_hpa: float,
+    step_cm1: float,
+    concentrations: dict[str, float] | None = None,
+) -> str:
+    if not gases:
+        return ""
+    nu_min, nu_max = normalize_wavenumber_window(range_unit, range_min, range_max)
+    gases_sorted = tuple(sorted(gases))
+    signature = _manual_cache_signature(gases_sorted, nu_min, nu_max)
+    concentration_signature = _manual_concentration_signature(concentrations)
+    timestamp = datetime.now().isoformat(timespec="seconds")
+
+    entries = _load_user_result_index()
+    snapshot_id = ""
+    for entry in entries:
+        if entry.get("signature") != signature:
+            continue
+        if abs(float(entry.get("temperature_c", 0.0)) - float(temperature_c)) > 1.0e-9:
+            continue
+        if abs(float(entry.get("pressure_hpa", 0.0)) - float(pressure_hpa)) > 1.0e-9:
+            continue
+        if abs(float(entry.get("step_cm1", 0.0)) - float(step_cm1)) > 1.0e-12:
+            continue
+        if str(entry.get("concentration_signature", "")) != concentration_signature:
+            continue
+        snapshot_id = str(entry.get("id"))
+        break
+
+    if not snapshot_id:
+        snapshot_id = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        entries.append(
+            {
+                "id": snapshot_id,
+                "signature": signature,
+                "gases": list(gases_sorted),
+                "nu_min": float(nu_min),
+                "nu_max": float(nu_max),
+                "temperature_c": float(temperature_c),
+                "pressure_hpa": float(pressure_hpa),
+                "step_cm1": float(step_cm1),
+                "concentration_signature": concentration_signature,
+                "point_count": len(serialized_result.get("wavenumber_cm1", [])),
+                "updated_at": timestamp,
+            }
+        )
+    else:
+        for entry in entries:
+            if entry.get("id") == snapshot_id:
+                entry["updated_at"] = timestamp
+                entry["point_count"] = len(serialized_result.get("wavenumber_cm1", []))
+                entry["concentration_signature"] = concentration_signature
+                break
+
+    _ensure_user_cache_dir()
+    (USER_RESULT_CACHE_DIR / f"{snapshot_id}.json").write_text(
+        json.dumps(serialized_result, ensure_ascii=True),
+        encoding="utf-8",
+    )
+    entries.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
+    _save_user_result_index(entries[:400])
+    return snapshot_id
+
+
+def list_manual_result_snapshots(
+    gases: tuple[str, ...],
+    range_unit: str,
+    range_min: float,
+    range_max: float,
+) -> list[dict[str, Any]]:
+    if not gases:
+        return []
+    nu_min, nu_max = normalize_wavenumber_window(range_unit, range_min, range_max)
+    signature = _manual_cache_signature(tuple(sorted(gases)), nu_min, nu_max)
+    entries = _load_user_result_index()
+    return [entry for entry in entries if str(entry.get("signature", "")) == signature]
+
+
+def load_manual_result_snapshot(snapshot_id: str) -> dict[str, Any] | None:
+    if not snapshot_id:
+        return None
+    path = USER_RESULT_CACHE_DIR / f"{snapshot_id}.json"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def load_matching_manual_result_snapshot(
+    gases: tuple[str, ...],
+    range_unit: str,
+    range_min: float,
+    range_max: float,
+    temperature_c: float,
+    pressure_hpa: float,
+    step_cm1: float,
+    concentrations: dict[str, float] | None = None,
+) -> dict[str, Any] | None:
+    concentration_signature = _manual_concentration_signature(concentrations)
+    entries = list_manual_result_snapshots(gases, range_unit, range_min, range_max)
+    for entry in entries:
+        if abs(float(entry.get("temperature_c", 0.0)) - float(temperature_c)) > 1.0e-9:
+            continue
+        if abs(float(entry.get("pressure_hpa", 0.0)) - float(pressure_hpa)) > 1.0e-9:
+            continue
+        if abs(float(entry.get("step_cm1", 0.0)) - float(step_cm1)) > 1.0e-12:
+            continue
+        if str(entry.get("concentration_signature", "")) != concentration_signature:
+            continue
+        snapshot_id = str(entry.get("id", ""))
+        payload = load_manual_result_snapshot(snapshot_id)
+        if payload:
+            return payload
+    return None
 
 
 def deserialize_manual_result(payload: dict[str, Any]) -> ManualSpectrumResult:
