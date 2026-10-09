@@ -17,6 +17,7 @@
     type,
     props,
   });
+  let pasClickSequence = 0;
 
   function displayFormula(gas) {
     return String(gas).replace(/[0-9]/g, (digit) => SUBSCRIPT_DIGITS[digit] || digit);
@@ -127,6 +128,51 @@
     return hoverDataFromPlot(graph);
   }
 
+  function forwardPasClicks(graphId, storeId) {
+    const graphHost = document.getElementById(graphId);
+    const graph = graphHost ? graphHost.querySelector(".js-plotly-plot") : null;
+    if (!graph || typeof graph.on !== "function" || graph.__tomExplorerPasClickBound) {
+      return;
+    }
+    graph.__tomExplorerPasClickBound = true;
+    graph.on("plotly_click", (event) => {
+      const point = event && Array.isArray(event.points) ? event.points[0] : null;
+      if (!point || !window.dash_clientside || typeof window.dash_clientside.set_props !== "function") {
+        return;
+      }
+      pasClickSequence += 1;
+      window.dash_clientside.set_props(storeId, {
+        data: {
+          sequence: pasClickSequence,
+          points: [{
+            x: point.x,
+            customdata: normalizeCustomdata(point.customdata),
+            curveNumber: point.curveNumber,
+          }],
+        },
+      });
+    });
+  }
+
+  function clearPreviousSearchOnRun() {
+    if (document.__tomExplorerSearchResetBound) {
+      return;
+    }
+    document.__tomExplorerSearchResetBound = true;
+    document.addEventListener("click", (event) => {
+      if (!event.target || typeof event.target.closest !== "function" || !event.target.closest("#search-run")) {
+        return;
+      }
+      if (!window.dash_clientside || typeof window.dash_clientside.set_props !== "function") {
+        return;
+      }
+      window.dash_clientside.set_props("search-store", { data: null });
+      window.dash_clientside.set_props("search-selected-spectrum-store", { data: null });
+      window.dash_clientside.set_props("search-results-table", { data: [], selected_rows: [] });
+      window.dash_clientside.set_props("search-status", { children: "" });
+    });
+  }
+
   function currentSearchHoverData() {
     const detailPlots = Array.from(document.querySelectorAll(".search-window-graph .js-plotly-plot"));
     for (const graph of detailPlots) {
@@ -215,6 +261,8 @@
   function ensureHoverPolling() {
     syncHoverPanel("manual-graph", "manual-hover-panel", "manual-spectrum-store", (data) => data || null);
     syncHoverPanel("search-graph", "search-hover-panel", "search-store", (data) => (data && data.spectrum ? data.spectrum : null), () => currentSearchHoverData());
+    forwardPasClicks("manual-graph", "manual-pas-click");
+    clearPreviousSearchOnRun();
   }
 
   function buildHoverChildren(hoverData, serializedResult) {

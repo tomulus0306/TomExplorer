@@ -4,12 +4,14 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from functools import lru_cache
 from itertools import combinations
+import gzip
 import math
 import json
 from pathlib import Path
 import pickle
 import re
 import shutil
+import time
 from typing import Any
 
 import numpy as np
@@ -26,7 +28,8 @@ CM3_PER_M3 = 1_000_000.0
 DEFAULT_MANUAL_STEP_CM1 = 0.01
 DEFAULT_SEARCH_STEP_CM1 = 0.02
 DEFAULT_MAX_PLOT_POINTS = 6000
-FETCH_MARGIN_CM1 = 5.0
+# Standardmäßige Linieninformationen links und rechts vom angefragten Wellenzahlbereich (in cm-1)
+FETCH_MARGIN_CM1 = 2.0
 PICKLE_REBUILD_TEMPERATURE_C = 35.0
 PICKLE_REBUILD_PRESSURE_HPA = 1013.25
 LOCAL_CACHE_MAX_GASES = 10
@@ -278,6 +281,7 @@ def _build_gas_library() -> dict[str, dict[str, Any]]:
 GAS_LIBRARY: dict[str, dict[str, Any]] = _build_gas_library()
 
 _FETCHED_RANGES: dict[str, tuple[float, float]] = {}
+_HAPI_TABLE_PARSE_SECONDS: dict[str, float] = {}
 _DB_STARTED = False
 _DB_PATH: str | None = None
 
@@ -504,7 +508,8 @@ def _ensure_database_started() -> None:
     db_path = str(DATA_DIR)
     if _DB_STARTED and _DB_PATH == db_path:
         return
-    hp.db_begin(db_path)
+    hp.LOCAL_TABLE_CACHE.clear()
+    hp.VARIABLES["BACKEND_DATABASE_NAME"] = db_path
     _DB_STARTED = True
     _DB_PATH = db_path
 
@@ -947,6 +952,47 @@ def _local_cache_covers_range(gas: str, nu_min: float, nu_max: float) -> bool:
     return cached[0] <= wanted_min and cached[1] >= wanted_max
 
 
+def hitran_download_preflight(
+    gases: tuple[str, ...] | list[str],
+    temperature_c: float,
+    pressure_hpa: float,
+    range_unit: str,
+    range_min: float,
+    range_max: float,
+) -> dict[str, Any]:
+    nu_min, nu_max = normalize_wavenumber_window(range_unit, range_min, range_max)
+    local_gases: list[str] = []
+    download_gases: list[str] = []
+    parse_gases: list[str] = []
+    parse_seconds_min = 0.0
+    parse_seconds_max = 0.0
+    for gas in sorted(set(gases)):
+        if _local_xsc_can_build(gas, temperature_c, pressure_hpa, nu_min, nu_max):
+            local_gases.append(gas)
+        elif _local_cache_covers_range(gas, nu_min, nu_max):
+            local_gases.append(gas)
+            if gas not in hp.LOCAL_TABLE_CACHE:
+                parse_gases.append(gas)
+                measured_seconds = _HAPI_TABLE_PARSE_SECONDS.get(gas)
+                if measured_seconds is not None:
+                    parse_seconds_min += max(0.05, measured_seconds * 0.7)
+                    parse_seconds_max += max(0.15, measured_seconds * 1.5)
+                else:
+                    data_path = DATA_DIR / f"{gas}.data"
+                    file_size = data_path.stat().st_size if data_path.exists() else 0
+                    parse_seconds_min += max(0.05, file_size / 20_000_000.0)
+                    parse_seconds_max += max(0.15, file_size / 4_000_000.0)
+        else:
+            download_gases.append(gas)
+    return {
+        "local_gases": local_gases,
+        "download_gases": download_gases,
+        "parse_gases": parse_gases,
+        "parse_seconds_min": parse_seconds_min,
+        "parse_seconds_max": parse_seconds_max,
+    }
+
+
 def _xsc_source_details_for_gas(
     gas: str,
     temperature_c: float,
@@ -1111,6 +1157,10 @@ def _ensure_species_available(gas: str, nu_min: float, nu_max: float) -> None:
             _FETCHED_RANGES[gas] = cached
 
     if cached and cached[0] <= wanted_min and cached[1] >= wanted_max:
+        if gas not in hp.LOCAL_TABLE_CACHE:
+            parse_started = time.perf_counter()
+            hp.storage2cache(gas)
+            _HAPI_TABLE_PARSE_SECONDS[gas] = time.perf_counter() - parse_started
         return
 
     gas_config = GAS_LIBRARY[gas]
@@ -1282,6 +1332,8 @@ def reset_hitran_tables(gases: tuple[str, ...] | None = None) -> list[str]:
             if table_path.exists():
                 table_path.unlink()
                 removed.append(table_path.name)
+            hp.LOCAL_TABLE_CACHE.pop(gas, None)
+            _HAPI_TABLE_PARSE_SECONDS.pop(gas, None)
         _FETCHED_RANGES.pop(gas, None)
     _local_table_range.cache_clear()
     return removed
@@ -1931,6 +1983,8 @@ def save_manual_result_snapshot(
     pressure_hpa: float,
     step_cm1: float,
     concentrations: dict[str, float] | None = None,
+    build_seconds: float | None = None,
+    download_gases: list[str] | None = None,
 ) -> str:
     if not gases:
         return ""
@@ -1941,51 +1995,55 @@ def save_manual_result_snapshot(
     timestamp = datetime.now().isoformat(timespec="seconds")
 
     entries = _load_user_result_index()
-    snapshot_id = ""
-    for entry in entries:
-        if entry.get("signature") != signature:
-            continue
-        if abs(float(entry.get("temperature_c", 0.0)) - float(temperature_c)) > 1.0e-9:
-            continue
-        if abs(float(entry.get("pressure_hpa", 0.0)) - float(pressure_hpa)) > 1.0e-9:
-            continue
-        if abs(float(entry.get("step_cm1", 0.0)) - float(step_cm1)) > 1.0e-12:
-            continue
-        if str(entry.get("concentration_signature", "")) != concentration_signature:
-            continue
-        snapshot_id = str(entry.get("id"))
-        break
-
-    if not snapshot_id:
-        snapshot_id = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-        entries.append(
-            {
-                "id": snapshot_id,
-                "signature": signature,
-                "gases": list(gases_sorted),
-                "nu_min": float(nu_min),
-                "nu_max": float(nu_max),
-                "temperature_c": float(temperature_c),
-                "pressure_hpa": float(pressure_hpa),
-                "step_cm1": float(step_cm1),
-                "concentration_signature": concentration_signature,
-                "point_count": len(serialized_result.get("wavenumber_cm1", [])),
-                "updated_at": timestamp,
-            }
-        )
-    else:
-        for entry in entries:
-            if entry.get("id") == snapshot_id:
-                entry["updated_at"] = timestamp
-                entry["point_count"] = len(serialized_result.get("wavenumber_cm1", []))
-                entry["concentration_signature"] = concentration_signature
-                break
+    temperature_signature = f"{float(temperature_c):.6f}"
+    pressure_signature = f"{float(pressure_hpa):.6f}"
+    step_signature = f"{float(step_cm1):.10g}"
+    matching_entry = next(
+        (
+            entry
+            for entry in entries
+            if entry.get("signature") == signature
+            and entry.get("concentration_signature", "") == concentration_signature
+            and f"{float(entry.get('temperature_c', 0.0)):.6f}" == temperature_signature
+            and f"{float(entry.get('pressure_hpa', 0.0)):.6f}" == pressure_signature
+            and f"{float(entry.get('step_cm1', 0.0)):.10g}" == step_signature
+        ),
+        None,
+    )
+    snapshot_id = (
+        str(matching_entry["id"])
+        if matching_entry and matching_entry.get("id")
+        else f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    )
+    entries = [entry for entry in entries if str(entry.get("id", "")) != snapshot_id]
+    entry = {
+        "id": snapshot_id,
+        "signature": signature,
+        "gases": list(gases_sorted),
+        "nu_min": float(nu_min),
+        "nu_max": float(nu_max),
+        "temperature_c": float(temperature_c),
+        "pressure_hpa": float(pressure_hpa),
+        "step_cm1": float(step_cm1),
+        "concentration_signature": concentration_signature,
+        "point_count": len(serialized_result.get("wavenumber_cm1", [])),
+        "updated_at": timestamp,
+        "download_gases": sorted(
+            set(download_gases)
+            if download_gases is not None
+            else set((matching_entry or {}).get("download_gases", []))
+        ),
+        "database_load_mode": "selective",
+    }
+    if build_seconds is not None and np.isfinite(float(build_seconds)) and build_seconds > 0.0:
+        entry["build_seconds"] = float(build_seconds)
+    elif matching_entry and matching_entry.get("build_seconds") is not None:
+        entry["build_seconds"] = float(matching_entry["build_seconds"])
+    entries.append(entry)
 
     _ensure_user_cache_dir()
-    (USER_RESULT_CACHE_DIR / f"{snapshot_id}.json").write_text(
-        json.dumps(serialized_result, ensure_ascii=True),
-        encoding="utf-8",
-    )
+    with gzip.open(USER_RESULT_CACHE_DIR / f"{snapshot_id}.json.gz", "wt", encoding="utf-8") as stream:
+        json.dump(serialized_result, stream, ensure_ascii=True, separators=(",", ":"))
     entries.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
     _save_user_result_index(entries[:400])
     return snapshot_id
@@ -1997,22 +2055,24 @@ def list_manual_result_snapshots(
     range_min: float,
     range_max: float,
 ) -> list[dict[str, Any]]:
-    if not gases:
-        return []
-    nu_min, nu_max = normalize_wavenumber_window(range_unit, range_min, range_max)
-    signature = _manual_cache_signature(tuple(sorted(gases)), nu_min, nu_max)
+    # Wir geben nun alle Snapshots zurück, damit im App-Callback eine Ähnlichkeitsprüfung durchgeführt werden kann.
     entries = _load_user_result_index()
-    return [entry for entry in entries if str(entry.get("signature", "")) == signature]
+    return entries
 
 
 def load_manual_result_snapshot(snapshot_id: str) -> dict[str, Any] | None:
     if not snapshot_id:
         return None
-    path = USER_RESULT_CACHE_DIR / f"{snapshot_id}.json"
-    if not path.exists():
-        return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        compressed_path = USER_RESULT_CACHE_DIR / f"{snapshot_id}.json.gz"
+        path = USER_RESULT_CACHE_DIR / f"{snapshot_id}.json"
+        if compressed_path.exists():
+            with gzip.open(compressed_path, "rt", encoding="utf-8") as stream:
+                payload = json.load(stream)
+        elif path.exists():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            return None
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None
@@ -2028,21 +2088,106 @@ def load_matching_manual_result_snapshot(
     step_cm1: float,
     concentrations: dict[str, float] | None = None,
 ) -> dict[str, Any] | None:
-    concentration_signature = _manual_concentration_signature(concentrations)
-    entries = list_manual_result_snapshots(gases, range_unit, range_min, range_max)
+    entries = _load_user_result_index()
+    nu_min, nu_max = normalize_wavenumber_window(range_unit, range_min, range_max)
+    requested_step = float(step_cm1)
+    requested_concentrations = concentrations or {}
+    requested_gases = {
+        gas for gas in gases if float(requested_concentrations.get(gas, 0.0)) > 0.0
+    }
+    if not requested_gases:
+        return None
     for entry in entries:
+        cached_gases = set(entry.get("gases", []))
+        if not requested_gases or not requested_gases.issubset(cached_gases):
+            continue
+        if float(entry.get("nu_min", 0.0)) > nu_min + requested_step * 0.05:
+            continue
+        if float(entry.get("nu_max", 0.0)) < nu_max - requested_step * 0.05:
+            continue
         if abs(float(entry.get("temperature_c", 0.0)) - float(temperature_c)) > 1.0e-9:
             continue
         if abs(float(entry.get("pressure_hpa", 0.0)) - float(pressure_hpa)) > 1.0e-9:
             continue
-        if abs(float(entry.get("step_cm1", 0.0)) - float(step_cm1)) > 1.0e-12:
+        cached_step = float(entry.get("step_cm1", 0.0))
+        if abs(cached_step - requested_step) > max(1.0e-12, requested_step * 1.0e-6):
             continue
-        if str(entry.get("concentration_signature", "")) != concentration_signature:
+
+        payload = load_manual_result_snapshot(str(entry.get("id", "")))
+        if not payload:
             continue
-        snapshot_id = str(entry.get("id", ""))
-        payload = load_manual_result_snapshot(snapshot_id)
-        if payload:
-            return payload
+        axis = np.asarray(payload.get("wavenumber_cm1", []), dtype=float)
+        wavelength_axis = np.asarray(payload.get("wavelength_um", []), dtype=float)
+        source_components = payload.get("components", {})
+        if axis.size < 2 or not np.all(np.diff(axis) > 0.0):
+            continue
+        if wavelength_axis.size != axis.size or not isinstance(source_components, dict):
+            continue
+        if not np.allclose(np.diff(axis), cached_step, rtol=1.0e-3, atol=1.0e-9):
+            continue
+        target_nu_min = round(nu_min, 6)
+        target_nu_max = round(nu_max, 6)
+        span_steps = (target_nu_max - target_nu_min) / requested_step
+        target_point_count = max(2, int(np.floor(span_steps + 1.0e-9)) + 1)
+        target_axis = target_nu_min + np.arange(target_point_count, dtype=float) * requested_step
+        if target_axis.size < 2:
+            continue
+        if axis[0] > target_axis[0] + cached_step * 1.0e-6:
+            continue
+        if axis[-1] < target_axis[-1] - cached_step * 1.0e-6:
+            continue
+
+        new_components: dict[str, dict[str, Any]] = {}
+        total_alpha = np.zeros(target_axis.size, dtype=float)
+        total_sigma = np.zeros_like(total_alpha)
+        for gas in sorted(requested_gases):
+            source_component = source_components.get(gas)
+            new_concentration = float(requested_concentrations.get(gas, 0.0))
+            if not isinstance(source_component, dict) or new_concentration <= 0.0:
+                break
+            source_sigma = np.asarray(source_component.get("sigma_cm2_per_molecule", []), dtype=float)
+            if source_sigma.size != axis.size:
+                break
+            sigma = np.interp(target_axis, axis, source_sigma)
+            alpha = sigma * total_number_density_cm3(temperature_c, pressure_hpa) * new_concentration
+            component = dict(source_component)
+            component["concentration"] = new_concentration
+            component["sigma_cm2_per_molecule"] = sigma.tolist()
+            component["alpha_per_cm"] = alpha.tolist()
+            new_components[gas] = component
+            total_sigma += sigma
+            total_alpha += alpha
+        else:
+            for gas in sorted(cached_gases - requested_gases):
+                source_component = source_components.get(gas)
+                if not isinstance(source_component, dict):
+                    continue
+                source_sigma = np.asarray(source_component.get("sigma_cm2_per_molecule", []), dtype=float)
+                if source_sigma.size != axis.size:
+                    continue
+                sigma = np.interp(target_axis, axis, source_sigma)
+                cached_concentration = float(source_component.get("concentration", 0.0))
+                component = dict(source_component)
+                component["sigma_cm2_per_molecule"] = sigma.tolist()
+                component["alpha_per_cm"] = (
+                    sigma * total_number_density_cm3(temperature_c, pressure_hpa) * cached_concentration
+                ).tolist()
+                new_components[gas] = component
+
+            result = dict(payload)
+            target_wavelength = np.asarray(wavenumber_cm1_to_wavelength_um(target_axis), dtype=float)
+            result["wavenumber_cm1"] = target_axis.tolist()
+            result["wavelength_um"] = target_wavelength.tolist()
+            result["components"] = new_components
+            result["default_visible_gases"] = sorted(requested_gases)
+            result["total_sigma_cm2_per_molecule"] = total_sigma.tolist()
+            result["total_alpha_per_cm"] = total_alpha.tolist()
+            result["step_cm1"] = cached_step
+            if range_unit == "um":
+                result["range_label"] = f"{float(target_wavelength.min()):.4f}-{float(target_wavelength.max()):.4f} um"
+            else:
+                result["range_label"] = f"{float(target_axis.min()):.2f}-{float(target_axis.max()):.2f} cm-1"
+            return result
     return None
 
 
@@ -2220,6 +2365,13 @@ def _peak_flank_baseline(profile: np.ndarray, left: int, right: int) -> float:
 
 
 def _window_metric_acceptance(metric: WindowGasMetric) -> tuple[bool, tuple[str, ...]]:
+    strong_2f_lod_escape_hatch = (
+        metric.peak_region_target_delta_alpha_per_cm > 0.0
+        and metric.prominence_ratio >= MIN_CANDIDATE_PROMINENCE_RATIO
+        and metric.peak_region_purity >= 0.70
+        and metric.peak_region_wms2f_selectivity >= 3.0
+        and metric.peak_region_wms2f_shape_similarity >= 0.95
+    )
     direct_signal_ok = metric.signal_to_interference >= MIN_ACCEPTABLE_SIGNAL_TO_INTERFERENCE
     soft_signal_ok = (
         metric.signal_to_interference >= 0.45
@@ -2259,14 +2411,16 @@ def _window_metric_acceptance(metric: WindowGasMetric) -> tuple[bool, tuple[str,
         or derivative_escape_hatch
         or strong_multigas_escape_hatch
         or ultra_clean_overlap_escape_hatch
+        or strong_2f_lod_escape_hatch
     )
-    delta_alpha_ok = metric.peak_region_delta_alpha_selectivity >= 1.1
+    delta_alpha_ok = metric.peak_region_delta_alpha_selectivity >= 1.1 or strong_2f_lod_escape_hatch
     wms2f_ok = metric.peak_region_wms2f_selectivity >= 0.7
     shape_ok = (
         metric.peak_region_wms2f_shape_similarity >= MIN_ACCEPTABLE_WMS2F_SHAPE_SIMILARITY
         or derivative_escape_hatch
         or strong_multigas_escape_hatch
         or ultra_clean_overlap_escape_hatch
+        or strong_2f_lod_escape_hatch
         or (metric.peak_region_purity >= 0.9 and metric.peak_region_wms2f_selectivity >= 4.0)
     )
     reasons: list[str] = []
@@ -2533,14 +2687,28 @@ def _evaluate_window_candidate(
         return None
 
     score += 180.0 * len(coverage) * len(coverage)
-    score -= max(0.0, 3.0 - worst_signal_to_interference) * 95.0
-    score -= max(0.0, 5.0 - mean_signal_to_interference) * 30.0
-    score -= max(0.0, 2.0 - worst_peak_region_selectivity) * 180.0
-    score -= max(0.0, 4.0 - mean_peak_region_selectivity) * 52.0
-    score -= max(0.0, 0.72 - worst_peak_region_purity) * 260.0
-    score -= max(0.0, 0.82 - mean_peak_region_purity) * 110.0
-    score -= max(0.0, 2.0 - worst_delta_alpha_selectivity) * 220.0
-    score -= max(0.0, 4.0 - mean_delta_alpha_selectivity) * 80.0
+    excellent_2f_window = bool(gas_metrics) and all(
+        metric.peak_region_wms2f_selectivity >= 4.0
+        and metric.peak_region_wms2f_shape_similarity >= 0.9
+        and metric.peak_region_target_delta_alpha_per_cm > 0.0
+        for metric in gas_metrics.values()
+    )
+    strong_2f_rescue_window = bool(gas_metrics) and all(
+        metric.peak_region_wms2f_selectivity >= 3.0
+        and metric.peak_region_wms2f_shape_similarity >= 0.95
+        and metric.peak_region_purity >= 0.70
+        and metric.peak_region_target_delta_alpha_per_cm > 0.0
+        for metric in gas_metrics.values()
+    )
+    alpha_penalty_scale = 0.15 if excellent_2f_window else 0.55 if strong_2f_rescue_window else 1.0
+    score -= alpha_penalty_scale * max(0.0, 3.0 - worst_signal_to_interference) * 95.0
+    score -= alpha_penalty_scale * max(0.0, 5.0 - mean_signal_to_interference) * 30.0
+    score -= alpha_penalty_scale * max(0.0, 2.0 - worst_peak_region_selectivity) * 180.0
+    score -= alpha_penalty_scale * max(0.0, 4.0 - mean_peak_region_selectivity) * 52.0
+    score -= alpha_penalty_scale * max(0.0, 0.72 - worst_peak_region_purity) * 260.0
+    score -= alpha_penalty_scale * max(0.0, 0.82 - mean_peak_region_purity) * 110.0
+    score -= alpha_penalty_scale * max(0.0, 2.0 - worst_delta_alpha_selectivity) * 220.0
+    score -= alpha_penalty_scale * max(0.0, 4.0 - mean_delta_alpha_selectivity) * 80.0
     score -= max(0.0, 1.5 - worst_wms2f_selectivity) * 260.0
     score -= max(0.0, 3.0 - mean_wms2f_selectivity) * 90.0
     score -= max(0.0, 0.72 - worst_wms2f_shape_similarity) * 320.0
@@ -2549,7 +2717,9 @@ def _evaluate_window_candidate(
     score -= max(0.0, required_span_nm - 2.0) * 6.0
 
     if score <= 0.0 and (len(coverage) < 2 or score < MIN_MULTI_TARGET_CANDIDATE_SCORE):
-        return None
+        if not strong_2f_rescue_window:
+            return None
+        score = 0.0
 
     return LaserWindowCandidate(
         window_id=f"{seed_gas}-{seed_index}-{required_min_um:.6f}-{required_max_um:.6f}",
@@ -2652,6 +2822,7 @@ def suggest_laser_plans(
     max_peak_candidates_per_gas: int = 40,
     top_window_pool: int = 90,
     top_plan_count: int = 24,
+    precomputed_result: ManualSpectrumResult | None = None,
 ) -> tuple[list[LaserPlan], ManualSpectrumResult]:
     if max_lasers < 1:
         raise ValueError("At least one laser must be allowed.")
@@ -2663,7 +2834,7 @@ def suggest_laser_plans(
     merged_concentrations = {**interference_concentrations, **target_concentrations}
     span_cm1 = normalize_wavenumber_window(range_unit, range_min, range_max)
     effective_step = step_cm1 or recommended_step_cm1(span_cm1[1] - span_cm1[0], manual_mode=False)
-    manual_result = build_manual_spectrum(
+    manual_result = precomputed_result or build_manual_spectrum(
         concentrations=merged_concentrations,
         temperature_c=temperature_c,
         pressure_hpa=pressure_hpa,
@@ -2730,6 +2901,57 @@ def suggest_laser_plans(
         if len(ranked_windows) >= top_window_pool:
             break
 
+    ranked_window_ids = {candidate.window_id for candidate in ranked_windows}
+    rescue_slots = max(2, min(12, len(target_gases) * 6))
+    rescue_added = 0
+    rescue_candidates = [
+        candidate
+        for candidate in sorted_windows
+        if any(
+            metric.peak_region_target_delta_alpha_per_cm > 0.0
+            and metric.peak_region_wms2f_selectivity >= 3.0
+            and metric.peak_region_wms2f_shape_similarity >= 0.95
+            and metric.peak_region_purity >= 0.70
+            and (
+                metric.signal_to_interference < 1.0
+                or metric.peak_region_delta_alpha_selectivity < 1.1
+            )
+            for metric in candidate.gas_metrics.values()
+        )
+    ]
+    best_lod_rescues = []
+    for gas in target_gases:
+        gas_rescues = [candidate for candidate in rescue_candidates if gas in candidate.gas_metrics]
+        if gas_rescues:
+            best_lod_rescues.append(
+                max(
+                    gas_rescues,
+                    key=lambda candidate: candidate.gas_metrics[gas].peak_region_target_delta_alpha_per_cm,
+                )
+            )
+    rescue_candidates = best_lod_rescues + rescue_candidates
+
+    for candidate in rescue_candidates:
+        if candidate.window_id in ranked_window_ids:
+            continue
+        too_similar = any(
+            candidate.coverage == existing.coverage
+            and _interval_overlap_fraction(
+                candidate.wavelength_min_um,
+                candidate.wavelength_max_um,
+                existing.wavelength_min_um,
+                existing.wavelength_max_um,
+            ) >= 0.85
+            for existing in ranked_windows
+        )
+        if too_similar:
+            continue
+        ranked_windows.append(candidate)
+        ranked_window_ids.add(candidate.window_id)
+        rescue_added += 1
+        if rescue_added >= rescue_slots:
+            break
+
     plans: list[LaserPlan] = []
     for laser_count in range(1, min(max_lasers, len(ranked_windows)) + 1):
         for combo in combinations(ranked_windows, laser_count):
@@ -2752,6 +2974,12 @@ def suggest_laser_plans(
                 )
                 for metric in metrics
             ) if metrics else 0.0
+            cross_sensitivity_penalty = sum(
+                max(0.0, 1.0 - metric.signal_to_interference) * 25_000.0
+                + max(0.0, 0.90 - metric.peak_region_purity) * 20_000.0
+                + max(0.0, 1.0 - metric.peak_region_delta_alpha_selectivity) * 30_000.0
+                for metric in metrics
+            )
             combo_score = 0.0
             combo_score += 6_000_000.0 * len(covered_targets)
             combo_score -= 8_000_000.0 * len(missing_targets)
@@ -2764,6 +2992,7 @@ def suggest_laser_plans(
             combo_score += math.log10(max(mean_peak_alpha, 1.0e-30)) * 15_000.0
             combo_score += weakest_margin_score * 5_000.0
             combo_score += sum(window.score for window in combo) * 6.0
+            combo_score -= cross_sensitivity_penalty
             if not missing_targets:
                 combo_score += 3_000_000.0
             plans.append(
@@ -2846,6 +3075,36 @@ def suggest_laser_plans(
     fallback_fill_target = min(top_plan_count, max(10, len(target_gases) * 4))
     if len(ranked_plans) < fallback_fill_target:
         append_ranked_plans(overlap_threshold=0.97, limit=fallback_fill_target)
+
+    ranked_signatures = {
+        (tuple(window.window_id for window in plan.windows), plan.covered_targets)
+        for plan in ranked_plans
+    }
+    complete_plans = [plan for plan in plans if not plan.missing_targets]
+    for gas in target_gases:
+        eligible_plans = [
+            plan
+            for plan in (complete_plans or plans)
+            if any(gas in window.gas_metrics for window in plan.windows)
+        ]
+        if not eligible_plans:
+            continue
+        best_lod_plan = max(
+            eligible_plans,
+            key=lambda plan: max(
+                (
+                    window.gas_metrics[gas].peak_region_target_delta_alpha_per_cm
+                    for window in plan.windows
+                    if gas in window.gas_metrics
+                ),
+                default=0.0,
+            ),
+        )
+        signature = (tuple(window.window_id for window in best_lod_plan.windows), best_lod_plan.covered_targets)
+        if signature in ranked_signatures:
+            continue
+        ranked_signatures.add(signature)
+        ranked_plans.append(best_lod_plan)
 
     ranked_plans = [
         LaserPlan(

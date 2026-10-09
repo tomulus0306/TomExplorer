@@ -34,6 +34,7 @@ from tomexplorer_core import (
     downsample_manual_result,
     format_concentration,
     gas_options,
+    hitran_download_preflight,
     hover_payload,
     list_manual_result_snapshots,
     load_manual_result_snapshot,
@@ -48,6 +49,7 @@ from tomexplorer_core import (
     suggest_laser_plans,
     wavelength_um_to_wavenumber_cm1,
     wavenumber_cm1_to_wavelength_um,
+    _manual_concentration_signature,
 )
 
 
@@ -337,6 +339,49 @@ def molar_fraction_to_value_unit(molar_fraction: float) -> tuple[float, str]:
     return value * 1.0e9, "ppb"
 
 
+def rescale_serialized_manual_spectrum(
+    serialized_result: dict[str, Any],
+    selected_gases: list[str],
+    concentrations: dict[str, float],
+) -> dict[str, Any] | None:
+    source_components = serialized_result.get("components")
+    if not isinstance(source_components, dict):
+        return None
+
+    active_gases = [gas for gas in selected_gases if concentrations.get(gas, 0.0) > 0.0]
+    if not active_gases or any(gas not in source_components for gas in active_gases):
+        return None
+
+    point_count = len(serialized_result.get("wavenumber_cm1", []))
+    total_alpha = np.zeros(point_count, dtype=float)
+    total_sigma = np.zeros(point_count, dtype=float)
+    components: dict[str, dict[str, Any]] = {}
+    for gas in active_gases:
+        component = source_components[gas]
+        previous_concentration = float(component.get("concentration", 0.0))
+        if previous_concentration <= 0.0:
+            return None
+        sigma = np.asarray(component.get("sigma_cm2_per_molecule", []), dtype=float)
+        alpha = np.asarray(component.get("alpha_per_cm", []), dtype=float)
+        if sigma.size != point_count or alpha.size != point_count:
+            return None
+
+        new_concentration = float(concentrations[gas])
+        alpha = alpha * (new_concentration / previous_concentration)
+        updated_component = dict(component)
+        updated_component["concentration"] = new_concentration
+        updated_component["alpha_per_cm"] = alpha.tolist()
+        components[gas] = updated_component
+        total_sigma += sigma
+        total_alpha += alpha
+
+    updated_result = dict(serialized_result)
+    updated_result["components"] = components
+    updated_result["total_sigma_cm2_per_molecule"] = total_sigma.tolist()
+    updated_result["total_alpha_per_cm"] = total_alpha.tolist()
+    return updated_result
+
+
 def manual_cache_option_label(entry: dict[str, Any]) -> str:
     def _safe_float(value: Any, default: float = 0.0) -> float:
         try:
@@ -509,6 +554,19 @@ def compute_pas_delta_alpha_min(
     )
 
 
+def sanitize_manual_delta_alpha_min(
+    value: float | int | str | None,
+    fallback: float,
+) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    if not np.isfinite(parsed) or parsed <= 0.0:
+        return float(fallback)
+    return parsed
+
+
 def pas_signature(serialized_result: dict[str, Any] | None, visible_gases: list[str] | None) -> str:
     if not serialized_result:
         return "empty"
@@ -635,6 +693,61 @@ def peak_from_interaction(
     return annotate_peak_metadata(result, visible_set, peak, preferred_gas)
 
 
+def peak_from_cursor_bounds(
+    x_start: float,
+    x_end: float,
+    serialized_result: dict[str, Any] | None,
+    visible_gases: list[str] | None,
+    x_unit: str,
+) -> dict[str, Any] | None:
+    if not serialized_result:
+        return None
+
+    result = deserialize_manual_result(serialized_result)
+    visible_set = {
+        gas
+        for gas in (visible_gases or list(result.components.keys()))
+        if gas in result.components
+    }
+    if not visible_set:
+        visible_set = set(result.components.keys())
+
+    wavelength_um, wavenumber_cm1, total_alpha = selected_total_alpha(serialized_result, list(visible_set))
+    x_values = wavenumber_cm1 if x_unit == "cm-1" else wavelength_um
+    first_index = nearest_index(x_values, x_start)
+    second_index = nearest_index(x_values, x_end)
+    left_index, right_index = sorted((first_index, second_index))
+    if right_index - left_index < 3:
+        return None
+
+    interval = np.arange(left_index, right_index + 1, dtype=int)
+    local_maxima = local_maxima_indices(total_alpha)
+    candidates = local_maxima[(local_maxima > left_index) & (local_maxima < right_index)]
+    if not candidates.size:
+        return None
+
+    apex_index = int(candidates[np.argmax(total_alpha[candidates])])
+    baseline_at_apex = float(
+        np.interp(
+            apex_index,
+            [left_index, right_index],
+            [total_alpha[left_index], total_alpha[right_index]],
+        )
+    )
+    delta_alpha = max(float(total_alpha[apex_index]) - baseline_at_apex, 0.0)
+    if not np.isfinite(delta_alpha) or delta_alpha <= 0.0:
+        return None
+
+    peak = {
+        "left": int(left_index),
+        "right": int(right_index),
+        "apex": apex_index,
+        "delta_alpha": delta_alpha,
+        "apex_alpha": float(total_alpha[apex_index]),
+    }
+    return annotate_peak_metadata(result, visible_set, peak)
+
+
 def interaction_x_value(point: dict[str, Any], x_unit: str) -> float | None:
     x_value = point.get("x")
     if x_value not in (None, ""):
@@ -653,6 +766,32 @@ def interaction_x_value(point: dict[str, Any], x_unit: str) -> float | None:
         except Exception:
             return None
     return None
+
+
+def place_pas_cursor(
+    state: dict[str, Any],
+    click_x: float,
+    serialized_result: dict[str, Any],
+    visible_gases: list[str] | None,
+    range_unit: str,
+) -> dict[str, Any]:
+    updated_state = dict(state)
+    active_cursor = updated_state.get("active_cursor")
+    if active_cursor not in {"cursor_1_x", "cursor_2_x"}:
+        active_cursor = "cursor_1_x"
+    updated_state[active_cursor] = float(click_x)
+    updated_state["hover"] = None
+    cursor_1_x = updated_state.get("cursor_1_x")
+    cursor_2_x = updated_state.get("cursor_2_x")
+    if cursor_1_x is not None and cursor_2_x is not None:
+        updated_state["selected"] = peak_from_cursor_bounds(
+            float(cursor_1_x),
+            float(cursor_2_x),
+            serialized_result,
+            visible_gases,
+            range_unit,
+        )
+    return updated_state
 
 
 def preferred_gas_from_interaction_point(
@@ -913,8 +1052,33 @@ def pas_lod_controls(prefix: str) -> html.Div:
             html.Div(
                 className="pas-lod-top-row",
                 children=[
-                    html.Button("PAS LoD Berechnung WM", id=f"{prefix}-pas-arm", className="secondary-button pas-lod-button"),
-                    html.Span(id=f"{prefix}-pas-prompt", className="pas-lod-prompt"),
+                    html.Button(
+                        "Cursor-Auswahl starten",
+                        id=f"{prefix}-pas-arm",
+                        className="secondary-button pas-lod-button",
+                    ),
+                    html.Div(
+                        className="pas-cursor-switch",
+                        role="group",
+                        **{"aria-label": "Aktiven LoD-Cursor auswählen"},
+                        children=[
+                            html.Button(
+                                "Cursor 1",
+                                id=f"{prefix}-pas-cursor-1",
+                                className="pas-cursor-button is-active",
+                            ),
+                            html.Button(
+                                "Cursor 2",
+                                id=f"{prefix}-pas-cursor-2",
+                                className="pas-cursor-button",
+                            ),
+                        ],
+                    ),
+                    html.Span(
+                        "Cursor 1 und 2 auf die gegenüberliegenden Peakflanken setzen.",
+                        id=f"{prefix}-pas-prompt",
+                        className="pas-lod-prompt",
+                    ),
                 ],
             ),
             html.Div(
@@ -957,9 +1121,11 @@ def pas_lod_controls(prefix: str) -> html.Div:
                         html.Span(["Δα", html.Sub("min"), " [cm⁻¹]"]),
                         dcc.Input(
                             id=f"{prefix}-pas-delta-alpha-min",
-                            type="text",
-                            value="1.8E-7",
-                            readOnly=True,
+                            type="number",
+                            value=PAS_REFERENCE_DELTA_ALPHA_MIN,
+                            min=0,
+                            step="any",
+                            debounce=True,
                             className="number-input",
                         ),
                     ),
@@ -975,8 +1141,74 @@ def pas_lod_controls(prefix: str) -> html.Div:
                     ),
                 ],
             ),
-            dcc.Store(id=f"{prefix}-pas-state", data={"armed": False, "signature": "empty", "selected": None, "hover": None}),
+            dcc.Store(
+                id=f"{prefix}-pas-state",
+                data={
+                    "armed": False,
+                    "signature": "empty",
+                    "selected": None,
+                    "hover": None,
+                    "cursor_1_x": None,
+                    "cursor_2_x": None,
+                    "active_cursor": "cursor_1_x",
+                },
+            ),
+            dcc.Store(id=f"{prefix}-pas-click", data=None),
         ],
+    )
+def search_lod_controls() -> html.Div:
+    return html.Div(
+        className="pas-lod-panel search-lod-settings",
+        children=[
+            html.H3("Automatische Zielgas-LoD", className="section-title"),
+            html.P(
+                "Die Trefferliste zeigt die PAS-LoD je Zielgas. Popt/ε fasst optische Leistung und Effizienz zusammen.",
+                className="section-copy small",
+            ),
+            html.Div(
+                className="pas-lod-grid",
+                children=[
+                    parameter_field(
+                        "3σ [nV]",
+                        dcc.Input(
+                            id="search-pas-3sigma",
+                            type="number",
+                            value=PAS_REFERENCE_SIGMA_NV,
+                            min=0,
+                            step="any",
+                            persistence=True,
+                            persistence_type="local",
+                            className="number-input",
+                        ),
+                    ),
+                    parameter_field(
+                        html.Span(["P", html.Sub("opt"), "/ε [mW]"], title="Effektiver Wert Popt geteilt durch Effizienz ε"),
+                        dcc.Input(
+                            id="search-pas-popt-eps",
+                            type="number",
+                            value=PAS_REFERENCE_POPT_MW / PAS_REFERENCE_EPS,
+                            min=1e-12,
+                            step="any",
+                            persistence=True,
+                            persistence_type="local",
+                            className="number-input",
+                        ),
+                    ),
+                ],
+            ),
+            html.Div(
+                ["Δα", html.Sub("min"), ": ", html.Strong("1.8E-7", id="search-pas-delta-alpha-min"), " cm⁻¹"],
+                className="search-lod-threshold",
+            ),
+        ],
+    )
+
+
+def pas_cursor_button_classes(state: dict[str, Any]) -> tuple[str, str]:
+    active_cursor = state.get("active_cursor", "cursor_1_x")
+    return (
+        "pas-cursor-button is-active" if active_cursor == "cursor_1_x" else "pas-cursor-button",
+        "pas-cursor-button is-active" if active_cursor == "cursor_2_x" else "pas-cursor-button",
     )
 
 
@@ -999,7 +1231,6 @@ def hero_logo() -> html.Div:
             ),
         ],
     )
-
 
 def make_axis_config(x_values: list[float]) -> tuple[list[float], list[str]]:
     if not x_values:
@@ -1420,6 +1651,21 @@ def make_spectrum_figure(
             fill_color="rgba(220, 38, 38, 0.24)",
             line_width=2.2,
         )
+        for cursor_number, cursor_key, color in (
+            (1, "cursor_1_x", "rgba(220, 38, 38, 0.92)"),
+            (2, "cursor_2_x", "rgba(15, 118, 110, 0.92)"),
+        ):
+            cursor_x = pas_state.get(cursor_key)
+            if cursor_x is not None:
+                figure.add_vline(
+                    x=float(cursor_x),
+                    line_width=1.7,
+                    line_dash="dash",
+                    line_color=color,
+                    annotation_text=f"Cursor {cursor_number}",
+                    annotation_position="top",
+                    annotation_font={"color": color, "size": 11},
+                )
 
     figure.add_trace(
         go.Scatter(
@@ -1649,21 +1895,39 @@ def format_plan_worst_case_metrics(plan: LaserPlan) -> str:
     )
 
 
-def search_table_rows(plans: list[LaserPlan], range_unit: str) -> list[dict[str, Any]]:
+def search_table_rows(
+    plans: list[LaserPlan],
+    range_unit: str,
+    target_concentrations: dict[str, float] | None = None,
+    delta_alpha_min: float = PAS_REFERENCE_DELTA_ALPHA_MIN,
+) -> list[dict[str, Any]]:
+    target_concentrations = target_concentrations or {}
     rows = []
     for plan in plans:
         ranges = " | ".join(format_laser_window_range(window, range_unit) for window in plan.windows)
-        rows.append(
-            {
-                "rank": plan.rank,
-                "score": round(plan.score, 1),
-                "lasers": len(plan.windows),
-                "covered": ", ".join(plan.covered_targets),
-                "missing": ", ".join(plan.missing_targets) or "-",
-                "ranges": ranges,
-                "robustness": format_plan_worst_case_metrics(plan),
-            }
-        )
+        row: dict[str, Any] = {
+            "rank": plan.rank,
+            "lasers": len(plan.windows),
+            "covered": ", ".join(plan.covered_targets),
+            "missing": ", ".join(plan.missing_targets) or "-",
+            "ranges": ranges,
+        }
+        for gas, concentration in sorted(target_concentrations.items()):
+            target_delta_alphas = [
+                window.gas_metrics[gas].peak_region_target_delta_alpha_per_cm
+                for window in plan.windows
+                if gas in window.gas_metrics
+                and window.gas_metrics[gas].peak_region_target_delta_alpha_per_cm > 0.0
+            ]
+            if concentration > 0.0 and target_delta_alphas:
+                best_delta_alpha = max(target_delta_alphas)
+                row[f"lod_{gas}"] = round(
+                    float(concentration) * 1.0e9 * float(delta_alpha_min) / best_delta_alpha,
+                    4,
+                )
+            else:
+                row[f"lod_{gas}"] = None
+        rows.append(row)
     return rows
 
 
@@ -1938,6 +2202,31 @@ def rebuild_selected_search_result(
 
     try:
         data_source = store.get("data_source", LIVE_DB_MODE)
+        if data_source == LIVE_DB_MODE:
+            cached_payload = load_matching_manual_result_snapshot(
+                gases=tuple(sorted(merged_concentrations)),
+                range_unit="um",
+                range_min=local_min_um,
+                range_max=local_max_um,
+                temperature_c=coarse_result.temperature_c,
+                pressure_hpa=coarse_result.pressure_hpa,
+                step_cm1=fine_step_cm1,
+                concentrations=merged_concentrations,
+            )
+            if cached_payload:
+                return deserialize_manual_result(cached_payload), fine_step_cm1
+
+        download_gases = []
+        if data_source == LIVE_DB_MODE:
+            download_gases = hitran_download_preflight(
+                tuple(sorted(merged_concentrations)),
+                coarse_result.temperature_c,
+                coarse_result.pressure_hpa,
+                "um",
+                local_min_um,
+                local_max_um,
+            )["download_gases"]
+        build_started = time.perf_counter()
         fine_result = build_manual_spectrum(
             concentrations=merged_concentrations,
             temperature_c=coarse_result.temperature_c,
@@ -1948,6 +2237,21 @@ def rebuild_selected_search_result(
             step_cm1=fine_step_cm1,
             data_source=data_source,
         )
+        build_seconds = time.perf_counter() - build_started
+        if data_source == LIVE_DB_MODE:
+            save_manual_result_snapshot(
+                serialized_result=serialize_manual_result(fine_result),
+                gases=tuple(sorted(merged_concentrations)),
+                range_unit="um",
+                range_min=local_min_um,
+                range_max=local_max_um,
+                temperature_c=fine_result.temperature_c,
+                pressure_hpa=fine_result.pressure_hpa,
+                step_cm1=fine_result.step_cm1,
+                concentrations=merged_concentrations,
+                build_seconds=build_seconds,
+                download_gases=download_gases,
+            )
     except Exception:
         return coarse_result, coarse_result.step_cm1
     return fine_result, fine_step_cm1
@@ -1981,14 +2285,15 @@ app.layout = html.Div(
             children=[
                 dcc.Checklist(
                     id="offline-mode",
-                    options=[{"label": "Schnelle offline DB verwenden", "value": OFFLINE_DB_MODE}],
-                    value=[OFFLINE_DB_MODE],
+                    options=[],
+                    value=[],
                     inline=True,
-                    className="offline-mode-toggle",
+                    style={"display": "none"},
                 ),
                 html.Span(id="offline-mode-meta", className="offline-mode-meta"),
                 html.Div(
                     className="offline-cache-picker",
+                    style={"display": "none"},
                     children=[
                         html.Span("Berechnungscache", className="field-label"),
                         dcc.Dropdown(
@@ -2000,6 +2305,46 @@ app.layout = html.Div(
                             className="mini-dropdown",
                         ),
                         html.Span(id="manual-offline-candidate-meta", className="offline-mode-meta"),
+                    ],
+                ),
+            ],
+        ),
+        html.Div(
+            id="manual-cache-dialog",
+            className="cache-dialog-backdrop",
+            style={"display": "none"},
+            children=[
+                html.Div(
+                    className="cache-dialog",
+                    role="dialog",
+                    **{"aria-modal": "true", "aria-labelledby": "manual-cache-dialog-title"},
+                    children=[
+                        html.H2("Gespeichertes Spektrum", id="manual-cache-dialog-title"),
+                        html.P(id="manual-cache-dialog-message"),
+                        html.Ul(id="manual-cache-dialog-differences", className="cache-dialog-differences"),
+                        html.P(id="manual-cache-dialog-summary", className="cache-dialog-summary"),
+                        html.P(id="manual-cache-dialog-cost", className="cache-dialog-cost"),
+                        html.Div(
+                            className="cache-dialog-actions",
+                            children=[
+                                html.Button(
+                                    "Ähnliches Spektrum übernehmen",
+                                    id="manual-cache-use",
+                                    className="secondary-button",
+                                    style={"display": "none"},
+                                ),
+                                html.Button(
+                                    "Mit HAPI neu berechnen",
+                                    id="manual-cache-hapi",
+                                    className="action-button",
+                                ),
+                                html.Button(
+                                    "Abbrechen",
+                                    id="manual-cache-cancel",
+                                    className="secondary-button",
+                                ),
+                            ],
+                        ),
                     ],
                 ),
             ],
@@ -2045,6 +2390,7 @@ app.layout = html.Div(
                                         html.Div(
                                             className="sidebar-scroll",
                                             children=[
+                                                html.Div("Scroll für weitere Einstellungen ↓", className="sidebar-scroll-hint"),
                                                 controls_section(
                                                     "Komponenten",
                                                     "Auswahl über Dropdown, Konzentrationen pro Komponente darunter. Details erscheinen unten im Hover-Feld statt direkt im Plot.",
@@ -2054,7 +2400,7 @@ app.layout = html.Div(
                                                             options=gas_options(),
                                                             value=DEFAULT_MANUAL_GASES,
                                                             multi=True,
-                                                            maxHeight=520,
+                                                            maxHeight=360,
                                                             optionHeight=38,
                                                             persistence=True,
                                                             persistence_type="local",
@@ -2217,31 +2563,31 @@ app.layout = html.Div(
                                                         ),
                                                     ],
                                                 ),
-                                            ],
-                                        ),
-                                        html.Div(id="manual-status", className="status-box sidebar-status-box"),
-                                        html.Div(
-                                            className="sidebar-actions",
-                                            children=[
+                                                html.Div(id="manual-status", className="status-box sidebar-status-box"),
                                                 html.Div(
-                                                    className="button-row",
+                                                    className="sidebar-actions",
                                                     children=[
                                                         html.Div(
-                                                            className="button-lock-wrap",
+                                                            className="button-row",
                                                             children=[
-                                                                html.Button("Lokalen HITRAN-Cache aktualisieren", id="manual-fetch", className="secondary-button"),
-                                                                html.Div("Bitte warten...", id="manual-fetch-manual-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
-                                                                html.Div("Bitte warten...", id="manual-fetch-search-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
+                                                                html.Div(
+                                                                    className="button-lock-wrap",
+                                                                    children=[
+                                                                        html.Button("Lokalen HITRAN-Cache aktualisieren", id="manual-fetch", className="secondary-button"),
+                                                                        html.Div("Bitte warten...", id="manual-fetch-manual-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
+                                                                        html.Div("Bitte warten...", id="manual-fetch-search-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
+                                                                    ],
+                                                                ),
+                                                                html.Button("CSV exportieren", id="manual-export", className="secondary-button"),
                                                             ],
                                                         ),
-                                                        html.Button("CSV exportieren", id="manual-export", className="secondary-button"),
+                                                        html.P(
+                                                            "Waehrend der HITRAN-Aktualisierung bitte keine neuen Berechnungen starten. Die ausgewaehlten Gase und die schnelle Offline-DB werden in dieser Zeit neu aufgebaut.",
+                                                            className="section-copy small",
+                                                        ),
+                                                        html.Div(id="manual-fetch-status", className="status-box"),
                                                     ],
                                                 ),
-                                                html.P(
-                                                    "Waehrend der HITRAN-Aktualisierung bitte keine neuen Berechnungen starten. Die ausgewaehlten Gase und die schnelle Offline-DB werden in dieser Zeit neu aufgebaut.",
-                                                    className="section-copy small",
-                                                ),
-                                                html.Div(id="manual-fetch-status", className="status-box"),
                                             ],
                                         ),
                                     ],
@@ -2263,12 +2609,20 @@ app.layout = html.Div(
                                                         ),
                                                     ],
                                                 ),
-                                                html.Div(id="manual-hover-panel", className="manual-hover-panel", children=hover_panel(None)),
+                                                html.Div(
+                                                    className="manual-side-panels",
+                                                    children=[
+                                                        html.Div(id="manual-hover-panel", className="manual-hover-panel", children=hover_panel(None)),
+                                                        pas_lod_controls("manual"),
+                                                    ],
+                                                ),
                                             ],
                                         ),
-                                        pas_lod_controls("manual"),
                                         html.Div(id="manual-source-info", children=source_details_panel(None, None, "um")),
                                         dcc.Store(id="manual-spectrum-store"),
+                                        dcc.Store(id="manual-view-range-store", data=None),
+                                        dcc.Store(id="manual-cache-dialog-store"),
+                                        dcc.Store(id="manual-cache-load-store", data=0),
                                         dcc.Store(id="manual-range-unit-store", data="um", storage_type="local"),
                                         dcc.Store(id="manual-cancel-store", data=0),
                                         dcc.Download(id="manual-export-download"),
@@ -2423,7 +2777,6 @@ app.layout = html.Div(
                                                         html.Div("Bitte warten...", id="search-run-fetch-lock", className="button-lock", style=BUTTON_LOCK_HIDDEN),
                                                     ],
                                                 ),
-                                                html.Div(id="search-status", className="status-box"),
                                             ],
                                         ),
                                     ],
@@ -2438,12 +2791,10 @@ app.layout = html.Div(
                                                     id="search-results-table",
                                                     columns=[
                                                         {"name": "Rang", "id": "rank"},
-                                                        {"name": "Score", "id": "score"},
                                                         {"name": "Laser", "id": "lasers"},
                                                         {"name": "Abgedeckt", "id": "covered"},
                                                         {"name": "Fehlt", "id": "missing"},
                                                         {"name": "Laserfenster", "id": "ranges"},
-                                                        {"name": "Worst-Case", "id": "robustness"},
                                                     ],
                                                     data=[],
                                                     row_selectable="single",
@@ -2454,10 +2805,19 @@ app.layout = html.Div(
                                                     style_cell={"backgroundColor": "#fffdf8", "color": "#1f2937", "fontFamily": BODY_FONT, "padding": "10px", "whiteSpace": "normal", "textAlign": "left"},
                                                     style_data_conditional=[{"if": {"state": "selected"}, "backgroundColor": "#facc15", "color": "#1f2937"}],
                                                 ),
+                                                dcc.Loading(
+                                                    type="circle",
+                                                    target_components={"search-status": "children"},
+                                                    children=html.Div(id="search-status", className="status-box search-run-status"),
+                                                ),
                                             ],
                                         ),
                                         dcc.Loading(
                                             type="circle",
+                                            target_components={
+                                                "search-window-figures": "children",
+                                                "search-plan-details": "children",
+                                            },
                                             children=[
                                                 html.Div(
                                                     className="graph-stack search-graph-stack",
@@ -2500,7 +2860,7 @@ app.layout = html.Div(
                                                             className="main-graph",
                                                             clear_on_unhover=False,
                                                         ),
-                                                        pas_lod_controls("search"),
+                                                        search_lod_controls(),
                                                         html.Div(id="search-source-info", children=source_details_panel(None, None, "um")),
                                                         html.Div(
                                                             id="search-window-figures",
@@ -2577,6 +2937,191 @@ def sync_manual_range_inputs(
     return converted_min, converted_max, min_label, max_label, range_unit
 
 
+def estimate_manual_hapi_cost(
+    selected_gases: list[str],
+    range_unit: str,
+    range_min: float,
+    range_max: float,
+    step_cm1: float,
+    temperature_c: float,
+    pressure_hpa: float,
+) -> str:
+    nu_min, nu_max = normalize_wavenumber_window(range_unit, range_min, range_max)
+    step = max(float(step_cm1), 1e-12)
+    point_count = max(2, int(np.ceil((nu_max - nu_min) / step)) + 1)
+    gas_count = max(1, len(set(selected_gases)))
+    gas_points = point_count * gas_count
+    target_gases = set(selected_gases)
+    preflight = hitran_download_preflight(
+        selected_gases,
+        temperature_c,
+        pressure_hpa,
+        range_unit,
+        range_min,
+        range_max,
+    )
+    download_gases = set(preflight["download_gases"])
+    parse_gases = list(preflight["parse_gases"])
+
+    historical_rates = []
+    for entry in list_manual_result_snapshots(tuple(sorted(target_gases)), range_unit, range_min, range_max):
+        entry_gases = set(entry.get("gases", []))
+        entry_points = int(entry.get("point_count", 0))
+        build_seconds = float(entry.get("build_seconds", 0.0) or 0.0)
+        if (
+            entry_gases != target_gases
+            or entry.get("database_load_mode") != "selective"
+            or entry.get("download_gases") is None
+            or set(entry.get("download_gases", [])) != download_gases
+            or entry_points < 2
+            or build_seconds <= 0.0
+        ):
+            continue
+        historical_rates.append(build_seconds / (entry_points * max(len(entry_gases), 1)))
+
+    seconds_per_gas_point = (
+        float(np.median(historical_rates[:7]))
+        if len(historical_rates) >= 3
+        else 1.0 / 25_000.0
+    )
+    expected_seconds = max(1.0, gas_points * seconds_per_gas_point)
+    lower_seconds = max(2.0, expected_seconds * 0.6)
+    upper_seconds = max(lower_seconds + 3.0, expected_seconds * 1.8)
+    parse_seconds_min = float(preflight["parse_seconds_min"])
+    parse_seconds_max = float(preflight["parse_seconds_max"])
+    lower_seconds += parse_seconds_min
+    upper_seconds += parse_seconds_max
+    if download_gases:
+        lower_seconds += 20.0 * len(download_gases)
+        upper_seconds += 180.0 * len(download_gases)
+
+    def format_duration(seconds: float) -> str:
+        if seconds < 60.0:
+            return f"{int(round(seconds))} s"
+        return f"{int(round(seconds / 60.0))} min"
+
+    point_text = f"{point_count:,}".replace(",", ".")
+    gas_point_text = f"{gas_points:,}".replace(",", ".")
+    data_notes = []
+    if download_gases:
+        data_notes.append(
+            f"Neue HITRAN-Daten nötig für {', '.join(sorted(download_gases))}; "
+            f"Download-Puffer grob 20–180 s je Gas, Netzwerk kann länger dauern."
+        )
+    if parse_gases:
+        data_notes.append(
+            f"Lokale HAPI-Tabellen werden erstmals eingelesen für {', '.join(parse_gases)} "
+            f"(Parse-Puffer {format_duration(parse_seconds_min)}–{format_duration(parse_seconds_max)}, kein Download)."
+        )
+    if not download_gases and not parse_gases:
+        data_notes.append("Lokale HITRAN-/XSC-Daten und HAPI-Tabellen sind bereits verfügbar.")
+    data_note = " ".join(data_notes)
+    return (
+        f"HAPI-Aufwand: ca. {point_text} Punkte × {gas_count} Gase "
+        f"({gas_point_text} Gas-Punkte). Geschätzte Dauer: "
+        f"{format_duration(lower_seconds)}–{format_duration(upper_seconds)}. {data_note} "
+        "Bei längerer Schätzung: Bereich einschränken oder Schrittweite vergrößern. "
+    )
+
+
+def suggest_manual_result_snapshot(
+    selected_gases: list[str],
+    range_unit: str,
+    range_min: float,
+    range_max: float,
+    temperature_c: float,
+    pressure_hpa: float,
+    step_cm1: float,
+    concentrations: dict[str, float],
+) -> dict[str, Any] | None:
+    target_nu_min, target_nu_max = normalize_wavenumber_window(range_unit, range_min, range_max)
+    target_gases = set(selected_gases)
+    target_concentration_signature = _manual_concentration_signature(concentrations)
+    candidates: list[tuple[float, dict[str, Any]]] = []
+
+    for entry in list_manual_result_snapshots(
+        tuple(sorted(target_gases)), range_unit, range_min, range_max
+    ):
+        entry_gases = set(entry.get("gases", []))
+        entry_nu_min = float(entry.get("nu_min", 0.0))
+        entry_nu_max = float(entry.get("nu_max", 0.0))
+        overlap = max(0.0, min(target_nu_max, entry_nu_max) - max(target_nu_min, entry_nu_min))
+        target_span = max(target_nu_max - target_nu_min, 1e-12)
+        overlap_ratio = overlap / target_span
+        if overlap_ratio < 0.5 or not (target_gases & entry_gases):
+            continue
+
+        differences: list[dict[str, str]] = []
+        missing_gases = target_gases - entry_gases
+        if missing_gases:
+            differences.append({"label": "Fehlende Gase", "value": ", ".join(sorted(missing_gases))})
+
+        range_difference = (
+            abs(entry_nu_min - target_nu_min) + abs(entry_nu_max - target_nu_max)
+        ) / target_span
+        if range_difference > 1e-4:
+            differences.append({
+                "label": "Bereich (cm⁻¹)",
+                "value": f"{entry_nu_min:.2f}–{entry_nu_max:.2f} statt {target_nu_min:.2f}–{target_nu_max:.2f}",
+            })
+
+        entry_temperature = float(entry.get("temperature_c", 0.0))
+        temperature_difference = abs(entry_temperature - temperature_c)
+        if temperature_difference > 0.1:
+            differences.append({
+                "label": "Temperatur",
+                "value": f"{entry_temperature:.1f} °C statt {temperature_c:.1f} °C",
+            })
+
+        entry_pressure = float(entry.get("pressure_hpa", 0.0))
+        pressure_difference = abs(entry_pressure - pressure_hpa)
+        if pressure_difference > 1.0:
+            differences.append({
+                "label": "Druck",
+                "value": f"{entry_pressure:.1f} hPa statt {pressure_hpa:.1f} hPa",
+            })
+
+        entry_step = float(entry.get("step_cm1", 0.0))
+        step_difference = abs(entry_step - step_cm1) / max(abs(step_cm1), 1e-12)
+        if step_difference > 0.05:
+            differences.append({
+                "label": "Schrittweite",
+                "value": f"{entry_step:.4f} statt {step_cm1:.4f} cm⁻¹",
+            })
+
+        entry_concentrations = {}
+        for part in str(entry.get("concentration_signature", "")).split("|"):
+            if not part:
+                continue
+            gas, raw_value = part.split(":", 1)
+            if gas in target_gases:
+                entry_concentrations[gas] = float(raw_value)
+        requested_entry_signature = _manual_concentration_signature(entry_concentrations)
+        if requested_entry_signature != target_concentration_signature:
+            differences.append({"label": "Konzentrationen", "value": "Abweichend von der aktuellen Auswahl"})
+        if not differences:
+            continue
+
+        score = (
+            len(differences) * 10.0
+            + range_difference * 100.0
+            + temperature_difference * 0.1
+            + pressure_difference * 0.01
+            + step_difference
+            + (1.0 - overlap_ratio) * 5.0
+        )
+        candidates.append((score, {
+            "snapshot_id": str(entry.get("id", "")),
+            "differences": differences,
+            "summary": (
+                f"Gespeichert: T={entry_temperature:.1f} °C, p={entry_pressure:.1f} hPa, "
+                f"Schrittweite={entry_step:.4f} cm⁻¹, {int(entry.get('point_count', 0))} Punkte."
+            ),
+        }))
+
+    return min(candidates, key=lambda candidate: candidate[0])[1] if candidates else None
+
+
 @app.callback(
     Output("manual-offline-candidate", "options"),
     Output("manual-offline-candidate", "value"),
@@ -2585,7 +3130,11 @@ def sync_manual_range_inputs(
     Input("manual-range-unit", "value"),
     Input("manual-range-min", "value"),
     Input("manual-range-max", "value"),
+    Input("manual-temperature", "value"),
+    Input("manual-pressure", "value"),
+    Input("manual-step", "value"),
     Input("manual-spectrum-store", "data"),
+    *MANUAL_CONCENTRATION_INPUTS,
     State("manual-offline-candidate", "value"),
 )
 def refresh_manual_cache_options(
@@ -2593,9 +3142,13 @@ def refresh_manual_cache_options(
     range_unit: str,
     range_min: float | None,
     range_max: float | None,
+    temperature_c: float | None,
+    pressure_hpa: float | None,
+    step_cm1: float | None,
     _spectrum: dict[str, Any] | None,
-    current_value: str | None,
+    *args: Any,
 ) -> tuple[list[dict[str, str]], str | None, str]:
+    current_value = args[-1] if args else None
     if not selected_gases or range_min in (None, "") or range_max in (None, ""):
         return [], None, ""
     try:
@@ -2608,30 +3161,137 @@ def refresh_manual_cache_options(
     except Exception:
         return [], None, ""
 
-    options = [{"label": manual_cache_option_label(entry), "value": str(entry["id"])} for entry in entries]
+    # Wir filtern die Einträge nicht mehr hart auf exakten Match! Wir bewerten stattdessen die Ähnlichkeit.
+    # Für jeden Eintrag berechnen wir die Abweichungen und markieren im Label, was abweicht (Temperatur, Druck, Schrittweite, Gase, Bereich).
+    # Wir sortieren sie so, dass die ähnlichsten ganz oben stehen.
+    try:
+        target_nu_min, target_nu_max = normalize_wavenumber_window(range_unit, float(range_min), float(range_max))
+    except Exception:
+        target_nu_min, target_nu_max = 0.0, 0.0
+
+    target_gases_set = set(selected_gases)
+
+    # Extraktion der Ziel-Konzentrationen
+    concentration_values = list(args[: len(ALL_GASES)])
+    concentration_units = list(args[len(ALL_GASES) : -1])
+    target_concentrations = collect_concentrations(concentration_values, concentration_units, selected_gases)
+    target_concentration_sig = _manual_concentration_signature(target_concentrations)
+
+    scored_options = []
+    for entry in entries:
+        # Analysiere Abweichungen
+        diff_reasons = []
+        is_exact = True
+
+        # 1. Gase checken
+        entry_gases = entry.get("gases", [])
+        entry_gases_set = set(entry_gases)
+        if entry_gases_set != target_gases_set:
+            is_exact = False
+            # Welche Gase fehlen im Cache oder sind zu viel?
+            missing_in_cache = target_gases_set - entry_gases_set
+            extra_in_cache = entry_gases_set - target_gases_set
+            gas_diffs = []
+            if missing_in_cache:
+                gas_diffs.append(f"fehlend: {','.join(missing_in_cache)}")
+            if extra_in_cache:
+                gas_diffs.append(f"zusätzlich: {','.join(extra_in_cache)}")
+            diff_reasons.append(f"Gase ({'; '.join(gas_diffs)})")
+
+        # 2. Wellenlängenbereich checken
+        entry_nu_min = float(entry.get("nu_min", 0.0))
+        entry_nu_max = float(entry.get("nu_max", 0.0))
+        # Berechne Überlappung
+        overlap_min = max(target_nu_min, entry_nu_min)
+        overlap_max = min(target_nu_max, entry_nu_max)
+        if overlap_max <= overlap_min:
+            # Keine Überlappung -> unbrauchbar
+            continue
+
+        # Abweichung Bereich
+        nu_diff_pct = (abs(entry_nu_min - target_nu_min) + abs(entry_nu_max - target_nu_max)) / (target_nu_max - target_nu_min + 1e-9)
+        if nu_diff_pct > 1e-4:
+            is_exact = False
+            diff_reasons.append("Bereich")
+
+        # 3. Temperatur checken
+        entry_t = float(entry.get("temperature_c", 0.0))
+        t_target = float(temperature_c or 0.0)
+        if abs(entry_t - t_target) > 0.1:
+            is_exact = False
+            diff_reasons.append(f"T={entry_t:.1f} vs {t_target:.1f} °C")
+
+        # 4. Druck checken
+        entry_p = float(entry.get("pressure_hpa", 0.0))
+        p_target = float(pressure_hpa or 0.0)
+        if abs(entry_p - p_target) > 1.0:
+            is_exact = False
+            diff_reasons.append(f"p={entry_p:.1f} vs {p_target:.1f} hPa")
+
+        # 5. Schrittweite checken
+        entry_step = float(entry.get("step_cm1", 0.0))
+        step_target = float(step_cm1 or 1e-3)
+        if abs(entry_step - step_target) / step_target > 0.05:
+            is_exact = False
+            diff_reasons.append(f"Schritt={entry_step:.4f} vs {step_target:.4f}")
+
+        # 6. Konzentrationen checken
+        entry_conc_sig = entry.get("concentration_signature", "")
+        if entry_conc_sig != target_concentration_sig:
+            is_exact = False
+            diff_reasons.append("Konzentrationen")
+
+        # Erzeuge Label
+        timestamp = str(entry.get("updated_at", ""))
+        points = int(entry.get("point_count", 0))
+
+        # Bestimme verfügbare Komponenten
+        available_components = entry.get("gases", [])
+        comp_str = ", ".join([display_formula(gas_name) for gas_name in ALL_GASES if gas_name in entry_gases_set])
+
+        if is_exact:
+            label = f"EXAKT MATCH | {timestamp} | T={entry_t:.1f} °C | p={entry_p:.1f} hPa | {points} Pkt. | Komponenten: {comp_str}"
+            score = 0 # Höchste Priorität
+        else:
+            diff_str = ", ".join(diff_reasons)
+            label = f"ÄHNLICH ({diff_str}) | {timestamp} | T={entry_t:.1f}°C | p={entry_p:.1f}hPa | {points} Pkt. | Komponenten: {comp_str}"
+            # Score berechnen: weniger Abweichungen = besser
+            score = 10 + len(diff_reasons) + nu_diff_pct * 100 + abs(entry_t - t_target)*0.1 + abs(entry_p - p_target)*0.01
+
+        scored_options.append((score, {"label": label, "value": str(entry["id"])}))
+
+    # Sortiere nach Score (niedrigste zuerst)
+    scored_options.sort(key=lambda x: x[0])
+    options = [item[1] for item in scored_options]
+
     valid_values = {str(item["value"]) for item in options}
     retained_value = current_value if current_value in valid_values else None
-    meta = f"{len(options)} gespeicherte Berechnungen gefunden" if options else "Keine gespeicherte Berechnung für aktuelle Gaswahl/Bereich"
-    return options, retained_value, meta
+    meta = f"{len(options)} gespeicherte Berechnungen gefunden" if options else "Keine passende CPU-Berechnung im Cache gefunden"
+    value_update = dash.no_update if retained_value == current_value else retained_value
+    return options, value_update, meta
 
 
 @app.callback(
     Output("manual-spectrum-store", "data", allow_duplicate=True),
+    Output("manual-cache-load-store", "data", allow_duplicate=True),
     Output("manual-status", "children", allow_duplicate=True),
     Output("offline-mode", "value", allow_duplicate=True),
     Output("manual-temperature", "value", allow_duplicate=True),
     Output("manual-pressure", "value", allow_duplicate=True),
     Output("manual-step", "value", allow_duplicate=True),
     Output("manual-gases", "value", allow_duplicate=True),
+    Output("manual-visible-gases", "value", allow_duplicate=True),
     *[Output(f"manual-concentration-value-{gas}", "value", allow_duplicate=True) for gas in ALL_GASES],
     *[Output(f"manual-concentration-unit-{gas}", "value", allow_duplicate=True) for gas in ALL_GASES],
     Input("manual-offline-candidate", "value"),
     State("offline-mode", "value"),
+    State("manual-gases", "value"),
     prevent_initial_call=True,
 )
 def load_manual_cache_candidate(
     snapshot_id: str | None,
     offline_selection: list[str] | None,
+    current_gases: list[str] | None,
 ) -> tuple[Any, ...]:
     if not snapshot_id:
         raise PreventUpdate
@@ -2640,8 +3300,6 @@ def load_manual_cache_candidate(
         raise PreventUpdate
 
     selected = list(offline_selection or [])
-    if OFFLINE_DB_MODE not in selected:
-        selected.append(OFFLINE_DB_MODE)
     payload = dict(payload)
     payload["render_revision"] = int(time.time() * 1000)
     temperature_value = payload.get("temperature_c", dash.no_update)
@@ -2649,7 +3307,9 @@ def load_manual_cache_candidate(
     step_value = payload.get("step_cm1", dash.no_update)
 
     components = payload.get("components", {}) if isinstance(payload.get("components", {}), dict) else {}
-    selected_gases = [gas for gas in ALL_GASES if gas in components]
+    requested_gases = set(current_gases or [])
+    selected_gases = [gas for gas in ALL_GASES if gas in components and gas in requested_gases]
+    payload["default_visible_gases"] = selected_gases
 
     concentration_values: list[float] = []
     concentration_units: list[str] = []
@@ -2667,15 +3327,78 @@ def load_manual_cache_candidate(
 
     return (
         payload,
+        int(time.time() * 1000),
         "Spektrum aus lokalem Berechnungscache geladen.",
         selected,
         temperature_value,
         pressure_value,
         step_value,
         selected_gases,
+        selected_gases,
         *concentration_values,
         *concentration_units,
     )
+
+
+@app.callback(
+    Output("manual-cache-dialog", "style"),
+    Output("manual-cache-dialog-message", "children"),
+    Output("manual-cache-dialog-differences", "children"),
+    Output("manual-cache-dialog-summary", "children"),
+    Output("manual-cache-dialog-cost", "children"),
+    Output("manual-cache-use", "style"),
+    Output("manual-cache-hapi", "children"),
+    Input("manual-cache-dialog-store", "data"),
+)
+def render_manual_cache_dialog(
+    dialog_data: dict[str, Any] | None,
+) -> tuple[dict[str, str], str, list[Any], str, str, dict[str, str], str]:
+    if not dialog_data:
+        return {"display": "none"}, "", [], "", "", {"display": "none"}, "Mit HAPI neu berechnen"
+
+    if dialog_data.get("kind") == "similar":
+        differences = [
+            html.Li([html.Strong(f"{item['label']}: "), html.Span(item["value"])])
+            for item in dialog_data.get("differences", [])
+        ]
+        return (
+            {"display": "flex"},
+            "Ein ähnliches gespeichertes Spektrum ist verfügbar. Beim Übernehmen werden die unten markierten Einstellungen auf die gespeicherten Werte gesetzt.",
+            differences,
+            str(dialog_data.get("summary", "")),
+            str(dialog_data.get("cost_summary", "")),
+            {"display": "block"},
+            "Stattdessen mit HAPI neu berechnen",
+        )
+
+    return (
+        {"display": "flex"},
+        "Für diese Einstellungen wurde kein ähnliches gespeichertes Spektrum gefunden.",
+        [],
+        "Für die aktuelle Auswahl muss ein neues Spektrum mit HAPI berechnet werden.",
+        str(dialog_data.get("cost_summary", "")),
+        {"display": "none"},
+        "OK, mit HAPI berechnen",
+    )
+
+
+@app.callback(
+    Output("manual-offline-candidate", "value", allow_duplicate=True),
+    Output("manual-cache-dialog-store", "data", allow_duplicate=True),
+    Input("manual-cache-use", "n_clicks"),
+    State("manual-cache-dialog-store", "data"),
+    prevent_initial_call=True,
+)
+def select_manual_cache_suggestion(
+    _n_clicks: int | None,
+    dialog_data: dict[str, Any] | None,
+) -> tuple[str, None]:
+    if not dialog_data or dialog_data.get("kind") != "similar":
+        raise PreventUpdate
+    snapshot_id = dialog_data.get("snapshot_id")
+    if not snapshot_id:
+        raise PreventUpdate
+    return str(snapshot_id), None
 
 
 @app.callback(
@@ -2714,8 +3437,8 @@ def refresh_offline_mode_state(
     Input("offline-mode", "value"),
 )
 def sync_offline_disabled_state(selection: list[str] | None) -> tuple[bool, bool, bool, bool, bool, bool]:
-    disabled = offline_mode_enabled(selection)
-    return disabled, disabled, disabled, disabled, disabled, disabled
+    # We maintain non-disabled state for user's control parameters
+    return False, False, False, False, False, False
 
 
 @app.callback(
@@ -2758,6 +3481,7 @@ def cancel_manual_run(n_clicks: int | None, token: int | None) -> int:
     Output("manual-spectrum-store", "data"),
     Output("manual-status", "children"),
     Output("offline-mode", "value", allow_duplicate=True),
+    Output("manual-cache-dialog-store", "data"),
     Input("manual-run", "n_clicks"),
     Input("manual-auto-update", "value"),
     Input("manual-gases", "value"),
@@ -2769,11 +3493,17 @@ def cancel_manual_run(n_clicks: int | None, token: int | None) -> int:
     Input("manual-pressure", "value"),
     Input("offline-mode", "value"),
     Input("manual-cancel-store", "data"),
+    Input("manual-cache-load-store", "data"),
+    Input("manual-cache-hapi", "n_clicks"),
+    Input("manual-cache-cancel", "n_clicks"),
     *MANUAL_CONCENTRATION_INPUTS,
     State("manual-spectrum-store", "data"),
+    State("manual-cache-dialog-store", "data"),
     running=[
         (Output("manual-run", "disabled"), True, False),
-        (Output("manual-run", "children"), "Spektrum wird berechnet...", "Spektrum berechnen"),
+        (Output("manual-run", "children"), "Prüfe Ergebniscache...", "Spektrum berechnen"),
+        (Output("manual-cache-hapi", "disabled"), True, False),
+        (Output("manual-cache-hapi", "className"), "action-button is-running", "action-button"),
         (Output("manual-cancel", "disabled"), False, True),
         (Output("manual-fetch-manual-lock", "style"), BUTTON_LOCK_VISIBLE, BUTTON_LOCK_HIDDEN),
     ],
@@ -2791,20 +3521,42 @@ def update_manual_spectrum(
     pressure_hpa: float,
     offline_selection: list[str] | None,
     _cancel_token: int,
+    _cache_load_token: int,
+    _cache_hapi_clicks: int | None,
+    _cache_cancel_clicks: int | None,
     *concentration_state_values: Any,
-) -> tuple[dict[str, Any] | None, str, list[str]]:
-    previous_serialized = concentration_state_values[-1] if concentration_state_values else None
-    concentration_state_values = concentration_state_values[:-1]
+) -> tuple[dict[str, Any] | None, str, list[str], dict[str, Any] | None]:
+    dialog_data = concentration_state_values[-1] if concentration_state_values else None
+    previous_serialized = concentration_state_values[-2] if len(concentration_state_values) > 1 else None
+    concentration_state_values = concentration_state_values[:-2]
     trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
     if trigger_id is None and dash.callback_context.triggered:
         trigger_id = str(dash.callback_context.triggered[0].get("prop_id", "")).split(".", 1)[0]
-    if trigger_id == "manual-cancel-store":
+    triggered_props = {
+        str(item.get("prop_id", "")) for item in dash.callback_context.triggered
+    }
+    if trigger_id == "manual-cancel-store" or any(
+        prop.startswith("manual-cache-load-store.") for prop in triggered_props
+    ):
+        raise PreventUpdate
+
+    if trigger_id == "manual-cache-cancel":
+        return previous_serialized, "Berechnung abgebrochen.", list(offline_selection or []), None
+
+    if trigger_id == "manual-cache-hapi" and not dialog_data:
         raise PreventUpdate
 
     MANUAL_CANCEL_EVENT.clear()
-    data_source = OFFLINE_DB_MODE if offline_mode_enabled(offline_selection) else LIVE_DB_MODE
+    data_source = (
+        LIVE_DB_MODE
+        if trigger_id == "manual-cache-hapi"
+        else OFFLINE_DB_MODE if offline_mode_enabled(offline_selection) else LIVE_DB_MODE
+    )
     auto_update_enabled = "auto" in (auto_update_selection or [])
-    if not auto_update_enabled and trigger_id != "manual-run":
+    if (
+        not auto_update_enabled
+        and trigger_id not in {"manual-run", "manual-cache-hapi"}
+    ):
         raise PreventUpdate
 
     if trigger_id in {"manual-range-unit", "manual-range-min", "manual-range-max"} and previous_serialized:
@@ -2832,13 +3584,14 @@ def update_manual_spectrum(
         gas_units = list(concentration_state_values[len(ALL_GASES) :])
         gas_tuple = tuple(sorted(set(selected_gases)))
         concentrations = collect_concentrations(gas_values, gas_units, selected_gases)
+
         parsed_range_min = parse_required_number(range_min, "Minimum")
         parsed_range_max = parse_required_number(range_max, "Maximum")
         parsed_temperature = parse_required_number(temperature_c, "T [°C]")
         parsed_pressure = parse_required_number(pressure_hpa, "p [hPa]")
         requested_step = parse_required_number(step_cm1, "Schrittweite [cm⁻¹]")
 
-        if data_source == LIVE_DB_MODE:
+        if trigger_id != "manual-cache-hapi":
             cached_payload = load_matching_manual_result_snapshot(
                 gases=gas_tuple,
                 range_unit=range_unit,
@@ -2850,24 +3603,70 @@ def update_manual_spectrum(
                 concentrations=concentrations,
             )
             if cached_payload:
-                cached_serialized = dict(cached_payload)
-                cached_serialized["render_revision"] = int(_n_clicks or 0)
+                cached_result = deserialize_manual_result(cached_payload)
+                cached_serialized = serialize_manual_result(downsample_manual_result(cached_result))
+                cached_serialized["default_visible_gases"] = list(
+                    cached_payload.get("default_visible_gases", gas_tuple)
+                )
+                cached_serialized["render_revision"] = int(time.time() * 1000)
                 cached_serialized["display_range_unit"] = range_unit
-                selected = list(offline_selection or [])
-                if OFFLINE_DB_MODE not in selected:
-                    selected.append(OFFLINE_DB_MODE)
                 return (
                     cached_serialized,
-                    "Spektrum vollständig aus lokalem Berechnungscache geladen (exakter Match für Gase/Bereich/T/p/Schrittweite/Konzentrationen).",
-                    selected,
+                    "Exaktes Spektrum aus dem Ergebniscache geladen; der Plot wurde für schnelle Anzeige reduziert.",
+                    list(offline_selection or []),
+                    None,
                 )
 
+            cost_summary = estimate_manual_hapi_cost(
+                selected_gases=selected_gases,
+                range_unit=range_unit,
+                range_min=parsed_range_min,
+                range_max=parsed_range_max,
+                step_cm1=requested_step,
+                temperature_c=parsed_temperature,
+                pressure_hpa=parsed_pressure,
+            )
+            suggestion = suggest_manual_result_snapshot(
+                selected_gases=selected_gases,
+                range_unit=range_unit,
+                range_min=parsed_range_min,
+                range_max=parsed_range_max,
+                temperature_c=parsed_temperature,
+                pressure_hpa=parsed_pressure,
+                step_cm1=requested_step,
+                concentrations=concentrations,
+            )
+            if suggestion:
+                return (
+                    previous_serialized,
+                    "Berechnung wartet auf deine Auswahl.",
+                    list(offline_selection or []),
+                    {"kind": "similar", **suggestion, "cost_summary": cost_summary},
+                )
+            return (
+                previous_serialized,
+                "Keine passende gespeicherte Berechnung gefunden; HAPI wartet auf Bestätigung.",
+                list(offline_selection or []),
+                {"kind": "none", "cost_summary": cost_summary},
+            )
+
         spectrum_span = abs(normalize_wavenumber_window(range_unit, parsed_range_min, parsed_range_max)[1] - normalize_wavenumber_window(range_unit, parsed_range_min, parsed_range_max)[0])
-        is_auto_preview = trigger_id != "manual-run"
+        is_auto_preview = trigger_id not in {"manual-run", "manual-cache-hapi"}
         effective_step = requested_step
         if is_auto_preview:
             preview_step = max(requested_step, spectrum_span / 3200.0, 0.02)
             effective_step = preview_step
+
+        download_gases = []
+        if data_source == LIVE_DB_MODE:
+            download_gases = hitran_download_preflight(
+                selected_gases,
+                parsed_temperature,
+                parsed_pressure,
+                range_unit,
+                parsed_range_min,
+                parsed_range_max,
+            )["download_gases"]
 
         t0 = time.perf_counter()
         manual_result = build_manual_spectrum(
@@ -2884,22 +3683,24 @@ def update_manual_spectrum(
         t1 = time.perf_counter()
         sampled_result = downsample_manual_result(manual_result)
         serialized = serialize_manual_result(sampled_result)
-        serialized["render_revision"] = int(_n_clicks or 0)
+        serialized["render_revision"] = int(time.time() * 1000)
         serialized["display_range_unit"] = range_unit
         t2 = time.perf_counter()
 
-        if not is_auto_preview:
-            save_manual_result_snapshot(
-                serialized_result=serialized,
-                gases=gas_tuple,
-                range_unit=range_unit,
-                range_min=parsed_range_min,
-                range_max=parsed_range_max,
-                temperature_c=manual_result.temperature_c,
-                pressure_hpa=manual_result.pressure_hpa,
-                step_cm1=manual_result.step_cm1,
-                concentrations=concentrations,
-            )
+        cache_serialized = serialize_manual_result(manual_result)
+        save_manual_result_snapshot(
+            serialized_result=cache_serialized,
+            gases=gas_tuple,
+            range_unit=range_unit,
+            range_min=parsed_range_min,
+            range_max=parsed_range_max,
+            temperature_c=manual_result.temperature_c,
+            pressure_hpa=manual_result.pressure_hpa,
+            step_cm1=manual_result.step_cm1,
+            concentrations=concentrations,
+            build_seconds=t1 - t0,
+            download_gases=download_gases,
+        )
 
         span_cm1 = abs(sampled_result.wavenumber_cm1.max() - sampled_result.wavenumber_cm1.min())
         suggested_step = recommended_step_cm1(span_cm1, manual_mode=True)
@@ -2919,13 +3720,13 @@ def update_manual_spectrum(
             status = "Vorschau (Auto-Update): gröbere Schrittweite für schnelle Reaktion. Mit 'Spektrum berechnen' wird die volle Auflösung gerechnet. " + status
         status += runtime_note
         status += coverage_gap_notice(manual_result, selected_gases, range_unit, "Fehlende Spektraldatenbereiche:")
-        return serialized, status, list(offline_selection or [])
+        return serialized, status, list(offline_selection or []), None
     except InterruptedError:
         if previous_serialized:
-            return previous_serialized, "Berechnung abgebrochen. Letztes Spektrum bleibt angezeigt.", list(offline_selection or [])
-        return None, "Berechnung abgebrochen.", list(offline_selection or [])
+            return previous_serialized, "Berechnung abgebrochen. Letztes Spektrum bleibt angezeigt.", list(offline_selection or []), None
+        return None, "Berechnung abgebrochen.", list(offline_selection or []), None
     except Exception as exc:
-        return None, format_data_source_error(exc, data_source, range_unit, range_min, range_max), list(offline_selection or [])
+        return None, format_data_source_error(exc, data_source, range_unit, range_min, range_max), list(offline_selection or []), None
 
 
 @app.callback(
@@ -2939,7 +3740,60 @@ def sync_manual_visible_gases(
     current_selection: list[str] | None,
 ) -> tuple[list[dict[str, str]], list[str]]:
     options = component_visibility_options(serialized_result)
+    if serialized_result and "default_visible_gases" in serialized_result:
+        current_selection = list(serialized_result.get("default_visible_gases") or [])
     return options, normalized_visible_gases(options, current_selection)
+
+
+@app.callback(
+    Output("manual-view-range-store", "data"),
+    Input("manual-spectrum-store", "data"),
+    Input("manual-range-unit", "value"),
+    Input("manual-graph", "relayoutData"),
+    State("manual-view-range-store", "data"),
+)
+def update_manual_view_range(
+    serialized_result: dict[str, Any] | None,
+    range_unit: str,
+    relayout_data: dict[str, Any] | None,
+    current_range: dict[str, Any] | None,
+) -> dict[str, Any]:
+    render_revision = (serialized_result or {}).get("render_revision")
+    trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
+    if trigger_id is None and dash.callback_context.triggered:
+        trigger_id = str(dash.callback_context.triggered[0].get("prop_id", "")).split(".", 1)[0]
+
+    if (
+        trigger_id in {"manual-spectrum-store", "manual-range-unit"}
+        or not current_range
+        or current_range.get("render_revision") != render_revision
+        or current_range.get("range_unit") != range_unit
+    ):
+        return {"render_revision": render_revision, "range_unit": range_unit, "x_range": None}
+
+    updated_range = dict(current_range)
+    updated_range["render_revision"] = render_revision
+    updated_range["range_unit"] = range_unit
+    changed = False
+    if relayout_data and relayout_data.get("xaxis.autorange"):
+        updated_range["x_range"] = None
+        changed = True
+    else:
+        x_range = extract_axis_range(relayout_data, "xaxis")
+        if x_range is not None:
+            updated_range["x_range"] = x_range
+            changed = True
+    if relayout_data and relayout_data.get("yaxis.autorange"):
+        updated_range["y_range"] = None
+        changed = True
+    else:
+        y_range = extract_axis_range(relayout_data, "yaxis")
+        if y_range is not None:
+            updated_range["y_range"] = y_range
+            changed = True
+    if not changed:
+        raise PreventUpdate
+    return updated_range
 
 
 @app.callback(
@@ -2952,9 +3806,9 @@ def sync_manual_visible_gases(
     Input("manual-visible-gases", "value"),
     Input("manual-pas-state", "data"),
     Input("manual-range-unit", "value"),
-    Input("manual-graph", "relayoutData"),
     State("manual-auto-update", "value"),
     State("manual-graph", "figure"),
+    State("manual-view-range-store", "data"),
 )
 def render_manual_spectrum(
     serialized_result: dict[str, Any] | None,
@@ -2964,9 +3818,9 @@ def render_manual_spectrum(
     visible_gases: list[str] | None,
     pas_state: dict[str, Any] | None,
     range_unit: str,
-    relayout_data: dict[str, Any] | None,
     auto_update_selection: list[str] | None,
     current_figure: dict[str, Any] | None,
+    current_view_range: dict[str, Any] | None,
 ) -> tuple[go.Figure, html.Div]:
     if not serialized_result:
         return empty_figure("Spektrum wird nach der ersten Berechnung hier angezeigt."), source_details_panel(None, None, range_unit)
@@ -2985,9 +3839,21 @@ def render_manual_spectrum(
         raise PreventUpdate
 
     log_y = "log" in (log_scale or [])
+    relayout_range = None
+    if (
+        trigger_id != "manual-spectrum-store"
+        and current_view_range
+        and current_view_range.get("render_revision") == serialized_result.get("render_revision")
+        and current_view_range.get("range_unit") == range_unit
+    ):
+        relayout_range = {}
+        if current_view_range.get("x_range"):
+            relayout_range["xaxis.range"] = current_view_range["x_range"]
+        if current_view_range.get("y_range"):
+            relayout_range["yaxis.range"] = current_view_range["y_range"]
     x_range, y_range = preserve_manual_ranges(
         current_figure,
-        relayout_data,
+        relayout_range,
         log_y,
         y_mode,
         range_unit,
@@ -3015,10 +3881,14 @@ def render_manual_spectrum(
     Output("manual-pas-prompt", "children"),
     Output("manual-pas-eps", "value"),
     Output("manual-graph", "style"),
+    Output("manual-pas-arm", "children"),
+    Output("manual-pas-cursor-1", "className"),
+    Output("manual-pas-cursor-2", "className"),
     Input("manual-pas-arm", "n_clicks"),
+    Input("manual-pas-cursor-1", "n_clicks"),
+    Input("manual-pas-cursor-2", "n_clicks"),
     Input("manual-graph", "hoverData"),
-    Input("manual-graph", "clickData"),
-    Input("manual-graph", "relayoutData"),
+    Input("manual-pas-click", "data"),
     Input("manual-spectrum-store", "data"),
     Input("manual-y-mode", "value"),
     Input("manual-range-unit", "value"),
@@ -3026,13 +3896,15 @@ def render_manual_spectrum(
     Input("manual-pas-3sigma", "value"),
     Input("manual-pas-popt", "value"),
     Input("manual-pas-eps", "value"),
+    Input("manual-pas-delta-alpha-min", "value"),
     State("manual-pas-state", "data"),
 )
 def update_manual_pas_lod(
     _arm_clicks: int | None,
+    _cursor_1_clicks: int | None,
+    _cursor_2_clicks: int | None,
     hover_data: dict[str, Any] | None,
     click_data: dict[str, Any] | None,
-    relayout_data: dict[str, Any] | None,
     serialized_result: dict[str, Any] | None,
     y_mode: str,
     range_unit: str,
@@ -3040,97 +3912,135 @@ def update_manual_pas_lod(
     sigma_3nv: float | None,
     p_opt_mw: float | None,
     eps_value: float | None,
+    manual_delta_alpha_min: float | None,
     current_state: dict[str, Any] | None,
-) -> tuple[dict[str, Any], str, str, str, float, dict[str, Any]]:
+) -> tuple[dict[str, Any], str, str, str, float, dict[str, Any], str, str, str]:
     state = dict(current_state or {})
     state.setdefault("armed", False)
     state.setdefault("signature", "empty")
     state.setdefault("selected", None)
     state.setdefault("hover", None)
-    state.setdefault("pending_x", None)
+    state.setdefault("cursor_1_x", state.pop("cursor_x", None))
+    state.setdefault("cursor_2_x", None)
+    state.setdefault("active_cursor", "cursor_1_x")
 
     eps_sanitized = sanitize_pas_eps(eps_value)
-    delta_alpha_min = compute_pas_delta_alpha_min(sigma_3nv, p_opt_mw, eps_sanitized)
+    reference_delta_alpha_min = compute_pas_delta_alpha_min(sigma_3nv, p_opt_mw, eps_sanitized)
     trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
     trigger_prop = ""
     if dash.callback_context.triggered:
         trigger_prop = str(dash.callback_context.triggered[0].get("prop_id", ""))
     if trigger_id is None and trigger_prop:
         trigger_id = trigger_prop.split(".", 1)[0]
+    parameter_triggered = trigger_id in {
+        "manual-pas-3sigma",
+        "manual-pas-popt",
+        "manual-pas-eps",
+    }
+    if parameter_triggered:
+        delta_alpha_min = reference_delta_alpha_min
+        delta_alpha_output: Any = delta_alpha_min
+    else:
+        delta_alpha_min = sanitize_manual_delta_alpha_min(
+            manual_delta_alpha_min,
+            reference_delta_alpha_min,
+        )
+        delta_alpha_output = dash.no_update
 
-    if trigger_id == "manual-graph" and not state.get("armed"):
+    if trigger_id in {"manual-graph", "manual-pas-click"} and not state.get("armed"):
         raise PreventUpdate
 
     if not serialized_result or y_mode != "alpha":
-        state = {"armed": False, "signature": "empty", "selected": None, "hover": None, "pending_x": None}
-        prompt = "PAS LoD nur bei Alpha-Ansicht verfügbar." if serialized_result else ""
-        return state, format_pas_delta_alpha(delta_alpha_min), "", prompt, eps_sanitized, {"cursor": "default"}
+        state = {
+            "armed": False,
+            "signature": "empty",
+            "selected": None,
+            "hover": None,
+            "cursor_1_x": None,
+            "cursor_2_x": None,
+            "active_cursor": "cursor_1_x",
+        }
+        if not serialized_result:
+            prompt = "Zuerst ein Spektrum in Alpha-Ansicht berechnen." if trigger_id == "manual-pas-arm" else dash.no_update
+        else:
+            prompt = "PAS-LoD ist nur in der Alpha-Ansicht verfügbar."
+        return (
+            state,
+            delta_alpha_output,
+            "",
+            prompt,
+            eps_sanitized,
+            {"cursor": "default"},
+            "Cursor-Auswahl starten",
+            *pas_cursor_button_classes(state),
+        )
 
-    signature = pas_signature(serialized_result, visible_gases)
+    signature = f"{pas_signature(serialized_result, visible_gases)}|{range_unit}"
     if state.get("signature") != signature:
-        state = {"armed": False, "signature": signature, "selected": None, "hover": None, "pending_x": None}
+        state = {
+            "armed": False,
+            "signature": signature,
+            "selected": None,
+            "hover": None,
+            "cursor_1_x": None,
+            "cursor_2_x": None,
+            "active_cursor": "cursor_1_x",
+        }
     else:
         state["signature"] = signature
 
     if trigger_id == "manual-pas-arm":
-        state["armed"] = True
-        state["selected"] = None
+        state["armed"] = not bool(state.get("armed"))
+        if state["armed"]:
+            if state.get("cursor_1_x") is None:
+                state["active_cursor"] = "cursor_1_x"
+            elif state.get("cursor_2_x") is None:
+                state["active_cursor"] = "cursor_2_x"
+        else:
+            state["cursor_1_x"] = None
+            state["cursor_2_x"] = None
+            state["selected"] = None
         state["hover"] = None
-        state["pending_x"] = None
+    elif trigger_id == "manual-pas-cursor-1":
+        state["active_cursor"] = "cursor_1_x"
+        state["armed"] = True
+    elif trigger_id == "manual-pas-cursor-2":
+        state["active_cursor"] = "cursor_2_x"
+        state["armed"] = True
 
-    if state.get("armed") and trigger_id == "manual-graph":
-        if trigger_prop.endswith("relayoutData") and relayout_has_explicit_x_range(relayout_data):
-            selected_peak = peak_from_x_window(relayout_data, serialized_result, visible_gases, range_unit)
-            if selected_peak:
-                state["selected"] = selected_peak
-                state["armed"] = False
-                state["pending_x"] = None
-            state["hover"] = None
-        elif trigger_prop.endswith("clickData") and click_data:
+    if state.get("armed") and trigger_id in {"manual-graph", "manual-pas-click"}:
+        if trigger_id == "manual-pas-click" and click_data:
             points = click_data.get("points") or []
             point = points[0] if points else {}
             click_x = interaction_x_value(point or {}, range_unit)
-            if click_x is not None and np.isfinite(click_x):
-                pending_x = state.get("pending_x")
-                if pending_x in (None, ""):
-                    state["pending_x"] = float(click_x)
-                    state["hover"] = peak_from_interaction(click_data, serialized_result, visible_gases, range_unit)
-                else:
-                    selected_peak = peak_from_x_bounds(float(pending_x), float(click_x), serialized_result, visible_gases, range_unit)
-                    if not selected_peak:
-                        selected_peak = peak_from_interaction(click_data, serialized_result, visible_gases, range_unit)
-                    if selected_peak:
-                        state["selected"] = selected_peak
-                        state["armed"] = False
-                    state["pending_x"] = None
-                    state["hover"] = None
-            else:
-                selected_peak = peak_from_interaction(click_data, serialized_result, visible_gases, range_unit)
-                if selected_peak:
-                    state["selected"] = selected_peak
-                    state["armed"] = False
-                    state["pending_x"] = None
+            if click_x is None or not np.isfinite(click_x):
                 state["hover"] = None
-        elif trigger_prop.endswith("hoverData"):
-            # Avoid continuous graph redraws while hovering; selection is click/drag only.
-            state["hover"] = None
+            else:
+                state = place_pas_cursor(
+                    state,
+                    float(click_x),
+                    serialized_result,
+                    visible_gases,
+                    range_unit,
+                )
+        elif trigger_id == "manual-graph" and trigger_prop.endswith("hoverData"):
+            raise PreventUpdate
     elif not state.get("armed"):
         state["hover"] = None
-        state["pending_x"] = None
 
     lod_text = format_pas_lod(delta_alpha_min, state.get("selected"))
     if state.get("armed"):
-        pending_x = state.get("pending_x")
-        if pending_x not in (None, "") and np.isfinite(float(pending_x)):
+        cursor_1_x = state.get("cursor_1_x")
+        cursor_2_x = state.get("cursor_2_x")
+        active_cursor_number = 1 if state.get("active_cursor") == "cursor_1_x" else 2
+        if cursor_1_x is None or cursor_2_x is None:
+            prompt = f"Cursor {active_cursor_number} ist aktiv. Einmal im Plot klicken, um ihn zu setzen."
+        else:
             unit_label = "cm⁻¹" if range_unit == "cm-1" else "µm"
             prompt = (
-                f"LoD-Auswahl aktiv: Start bei {float(pending_x):.4f} {unit_label} gesetzt. "
-                "Jetzt rechten Rand klicken oder Peakbereich mit linker Maustaste aufziehen."
-            )
-        else:
-            prompt = (
-                "LoD-Auswahl aktiv: Entweder Peakbereich mit linker Maustaste aufziehen "
-                "oder zwei Mal klicken (links/rechts)."
+                f"Cursor 1: {float(cursor_1_x):.5f} {unit_label}; "
+                f"Cursor 2: {float(cursor_2_x):.5f} {unit_label}. "
+                f"Cursor {active_cursor_number} ist aktiv; Plotklick verschiebt ihn."
             )
     elif state.get("selected"):
         selected_peak = state.get("selected") or {}
@@ -3144,12 +4054,34 @@ def update_manual_pas_lod(
         else:
             prompt = f"Peak gewählt: Δα = {float(selected_peak.get('delta_alpha', 0.0)):.3E} 1/cm"
     else:
-        if trigger_id == "manual-graph":
-            prompt = "Im gewählten Bereich wurde kein lokales Peak-Maximum im Summenspektrum gefunden. Bitte enger um den Zielpeak wählen."
+        if trigger_id in {"manual-graph", "manual-pas-click"}:
+            prompt = "Kein Peak zwischen den Cursorlinien erkannt. Cursor 1 oder 2 auswählen und verschieben."
         else:
-            prompt = ""
+            prompt = "Cursor 1 und 2 auf die gegenüberliegenden Peakflanken setzen."
     graph_style = {"cursor": "crosshair"} if state.get("armed") else {"cursor": "default"}
-    return state, format_pas_delta_alpha(delta_alpha_min), lod_text, prompt, eps_sanitized, graph_style
+    button_text = "Auswahl beenden" if state.get("armed") else "Cursor-Auswahl starten"
+    if trigger_id == "manual-pas-delta-alpha-min":
+        return (
+            dash.no_update,
+            dash.no_update,
+            lod_text,
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+        )
+    return (
+        state,
+        delta_alpha_output,
+        lod_text,
+        prompt,
+        eps_sanitized,
+        graph_style,
+        button_text,
+        *pas_cursor_button_classes(state),
+    )
 
 
 @app.callback(
@@ -3179,155 +4111,6 @@ def export_manual_spectrum_csv(
     )
     csv_content = build_manual_export_csv(serialized_result, range_unit, x_range)
     return dcc.send_string(csv_content, manual_export_filename(serialized_result))
-
-
-@app.callback(
-    Output("search-pas-state", "data"),
-    Output("search-pas-delta-alpha-min", "value"),
-    Output("search-pas-lod", "value"),
-    Output("search-pas-prompt", "children"),
-    Output("search-pas-eps", "value"),
-    Output("search-graph", "style"),
-    Input("search-pas-arm", "n_clicks"),
-    Input("search-graph", "hoverData"),
-    Input("search-graph", "clickData"),
-    Input("search-graph", "relayoutData"),
-    Input("search-selected-spectrum-store", "data"),
-    Input("search-store", "data"),
-    Input("search-range-unit", "value"),
-    Input("search-visible-gases", "value"),
-    Input("search-pas-3sigma", "value"),
-    Input("search-pas-popt", "value"),
-    Input("search-pas-eps", "value"),
-    State("search-pas-state", "data"),
-)
-def update_search_pas_lod(
-    _arm_clicks: int | None,
-    hover_data: dict[str, Any] | None,
-    click_data: dict[str, Any] | None,
-    relayout_data: dict[str, Any] | None,
-    selected_result_store: dict[str, Any] | None,
-    store: dict[str, Any] | None,
-    range_unit: str,
-    visible_gases: list[str] | None,
-    sigma_3nv: float | None,
-    p_opt_mw: float | None,
-    eps_value: float | None,
-    current_state: dict[str, Any] | None,
-) -> tuple[dict[str, Any], str, str, str, float, dict[str, Any]]:
-    serialized_result = None
-    if selected_result_store and selected_result_store.get("spectrum"):
-        serialized_result = selected_result_store.get("spectrum")
-    elif store and store.get("spectrum"):
-        serialized_result = store.get("spectrum")
-
-    state = dict(current_state or {})
-    state.setdefault("armed", False)
-    state.setdefault("signature", "empty")
-    state.setdefault("selected", None)
-    state.setdefault("hover", None)
-    state.setdefault("pending_x", None)
-
-    eps_sanitized = sanitize_pas_eps(eps_value)
-    delta_alpha_min = compute_pas_delta_alpha_min(sigma_3nv, p_opt_mw, eps_sanitized)
-    trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
-    trigger_prop = ""
-    if dash.callback_context.triggered:
-        trigger_prop = str(dash.callback_context.triggered[0].get("prop_id", ""))
-    if trigger_id is None and trigger_prop:
-        trigger_id = trigger_prop.split(".", 1)[0]
-
-    if trigger_id == "search-graph" and not state.get("armed"):
-        raise PreventUpdate
-
-    if not serialized_result:
-        state = {"armed": False, "signature": "empty", "selected": None, "hover": None, "pending_x": None}
-        return state, format_pas_delta_alpha(delta_alpha_min), "", "", eps_sanitized, {"cursor": "default"}
-
-    signature = pas_signature(serialized_result, visible_gases)
-    if state.get("signature") != signature:
-        state = {"armed": False, "signature": signature, "selected": None, "hover": None, "pending_x": None}
-    else:
-        state["signature"] = signature
-
-    if trigger_id == "search-pas-arm":
-        state["armed"] = True
-        state["selected"] = None
-        state["hover"] = None
-        state["pending_x"] = None
-
-    if state.get("armed") and trigger_id == "search-graph":
-        if trigger_prop.endswith("relayoutData") and relayout_has_explicit_x_range(relayout_data):
-            selected_peak = peak_from_x_window(relayout_data, serialized_result, visible_gases, range_unit)
-            if selected_peak:
-                state["selected"] = selected_peak
-                state["armed"] = False
-                state["pending_x"] = None
-            state["hover"] = None
-        elif trigger_prop.endswith("clickData") and click_data:
-            points = click_data.get("points") or []
-            point = points[0] if points else {}
-            click_x = interaction_x_value(point or {}, range_unit)
-            if click_x is not None and np.isfinite(click_x):
-                pending_x = state.get("pending_x")
-                if pending_x in (None, ""):
-                    state["pending_x"] = float(click_x)
-                    state["hover"] = peak_from_interaction(click_data, serialized_result, visible_gases, range_unit)
-                else:
-                    selected_peak = peak_from_x_bounds(float(pending_x), float(click_x), serialized_result, visible_gases, range_unit)
-                    if not selected_peak:
-                        selected_peak = peak_from_interaction(click_data, serialized_result, visible_gases, range_unit)
-                    if selected_peak:
-                        state["selected"] = selected_peak
-                        state["armed"] = False
-                    state["pending_x"] = None
-                    state["hover"] = None
-            else:
-                selected_peak = peak_from_interaction(click_data, serialized_result, visible_gases, range_unit)
-                if selected_peak:
-                    state["selected"] = selected_peak
-                    state["armed"] = False
-                    state["pending_x"] = None
-                state["hover"] = None
-        elif trigger_prop.endswith("hoverData"):
-            # Avoid continuous graph redraws while hovering; selection is click/drag only.
-            state["hover"] = None
-    elif not state.get("armed"):
-        state["hover"] = None
-        state["pending_x"] = None
-
-    lod_text = format_pas_lod(delta_alpha_min, state.get("selected"))
-    if state.get("armed"):
-        pending_x = state.get("pending_x")
-        if pending_x not in (None, "") and np.isfinite(float(pending_x)):
-            unit_label = "cm⁻¹" if range_unit == "cm-1" else "µm"
-            prompt = (
-                f"LoD-Auswahl aktiv: Start bei {float(pending_x):.4f} {unit_label} gesetzt. "
-                "Jetzt rechten Rand klicken oder Peakbereich mit linker Maustaste aufziehen."
-            )
-        else:
-            prompt = (
-                "LoD-Auswahl aktiv: Entweder Peakbereich mit linker Maustaste aufziehen "
-                "oder zwei Mal klicken (links/rechts)."
-            )
-    elif state.get("selected"):
-        selected_peak = state.get("selected") or {}
-        dominant_gas = str(selected_peak.get("dominant_gas", ""))
-        dominant_conc_ppbv = float(selected_peak.get("dominant_concentration_ppbv", float("nan")))
-        if dominant_gas and np.isfinite(dominant_conc_ppbv) and dominant_conc_ppbv > 0.0:
-            prompt = (
-                f"Peak gewählt: Δα = {float(selected_peak.get('delta_alpha', 0.0)):.3E} 1/cm "
-                f"| Gas {display_formula(dominant_gas)} bei {dominant_conc_ppbv:.3g} ppbV"
-            )
-        else:
-            prompt = f"Peak gewählt: Δα = {float(selected_peak.get('delta_alpha', 0.0)):.3E} 1/cm"
-    else:
-        if trigger_id == "search-graph":
-            prompt = "Im gewählten Bereich wurde kein lokales Peak-Maximum im Summenspektrum gefunden. Bitte enger um den Zielpeak wählen."
-        else:
-            prompt = ""
-    graph_style = {"cursor": "crosshair"} if state.get("armed") else {"cursor": "default"}
-    return state, format_pas_delta_alpha(delta_alpha_min), lod_text, prompt, eps_sanitized, graph_style
 
 
 @app.callback(
@@ -3486,22 +4269,96 @@ def run_band_search(
         )
         parsed_range_min = parse_required_number(range_min_value, "Minimum")
         parsed_range_max = parse_required_number(range_max_value, "Maximum")
+        parsed_temperature = parse_required_number(temperature_c, "T [°C]")
+        parsed_pressure = parse_required_number(pressure_hpa, "p [hPa]")
+        requested_step = parse_required_number(step_cm1, "Schrittweite [cm⁻¹]")
+        merged_concentrations = {**interference_concentrations, **target_concentrations}
+        cached_search_result = None
+        search_download_gases: list[str] = []
+        if data_source == LIVE_DB_MODE:
+            preflight = hitran_download_preflight(
+                tuple(sorted(merged_concentrations)),
+                parsed_temperature,
+                parsed_pressure,
+                range_unit,
+                parsed_range_min,
+                parsed_range_max,
+            )
+            search_download_gases = preflight["download_gases"]
+            cached_search_payload = load_matching_manual_result_snapshot(
+                gases=tuple(sorted(merged_concentrations)),
+                range_unit=range_unit,
+                range_min=parsed_range_min,
+                range_max=parsed_range_max,
+                temperature_c=parsed_temperature,
+                pressure_hpa=parsed_pressure,
+                step_cm1=requested_step,
+                concentrations=merged_concentrations,
+            )
+            if cached_search_payload:
+                cached_search_result = deserialize_manual_result(cached_search_payload)
+        search_spectrum_cached = cached_search_result is not None
         plans, search_result = suggest_laser_plans(
             target_concentrations=target_concentrations,
             interference_concentrations=interference_concentrations,
-            temperature_c=parse_required_number(temperature_c, "T [°C]"),
-            pressure_hpa=parse_required_number(pressure_hpa, "p [hPa]"),
+            temperature_c=parsed_temperature,
+            pressure_hpa=parsed_pressure,
             range_unit=range_unit,
             range_min=parsed_range_min,
             range_max=parsed_range_max,
             tuning_range_nm=parse_required_number(tuning_range_nm, "Durchstimmbereich [nm]"),
             max_lasers=int(parse_required_number(max_lasers, "Maximale Laserzahl")),
-            step_cm1=parse_required_number(step_cm1, "Schrittweite [cm⁻¹]"),
+            step_cm1=requested_step,
             data_source=data_source,
+            precomputed_result=cached_search_result,
         )
+        if data_source == LIVE_DB_MODE and cached_search_result is None:
+            save_manual_result_snapshot(
+                serialized_result=serialize_manual_result(search_result),
+                gases=tuple(sorted(merged_concentrations)),
+                range_unit=range_unit,
+                range_min=parsed_range_min,
+                range_max=parsed_range_max,
+                temperature_c=search_result.temperature_c,
+                pressure_hpa=search_result.pressure_hpa,
+                step_cm1=search_result.step_cm1,
+                concentrations=merged_concentrations,
+                download_gases=search_download_gases,
+            )
         result_limit = max(1, min(10, int(parse_required_number(result_limit_value, "Beste Treffer [1-10]"))))
         sampled_result = downsample_manual_result(search_result)
-        visible_plans = plans[:result_limit]
+        visible_plans = list(plans[:result_limit])
+        visible_plan_signatures = {
+            tuple(window.window_id for window in plan.windows)
+            for plan in visible_plans
+        }
+        complete_plans = [plan for plan in plans if not plan.missing_targets]
+        lod_alternatives_added = 0
+        for gas in sorted(target_concentrations):
+            gas_plans = [
+                plan
+                for plan in (complete_plans or plans)
+                if any(gas in window.gas_metrics for window in plan.windows)
+            ]
+            if not gas_plans:
+                continue
+            best_lod_plan = max(
+                gas_plans,
+                key=lambda plan: max(
+                    (
+                        window.gas_metrics[gas].peak_region_target_delta_alpha_per_cm
+                        for window in plan.windows
+                        if gas in window.gas_metrics
+                    ),
+                    default=0.0,
+                ),
+            )
+            signature = tuple(window.window_id for window in best_lod_plan.windows)
+            if signature in visible_plan_signatures:
+                continue
+            visible_plan_signatures.add(signature)
+            visible_plans.append(best_lod_plan)
+            lod_alternatives_added += 1
         store = build_search_store(
             plans=visible_plans,
             serialized_spectrum=serialize_manual_result(sampled_result),
@@ -3510,14 +4367,20 @@ def run_band_search(
             range_unit=range_unit,
             data_source=data_source,
         )
+        store["search_revision"] = time.time_ns()
         coverage_notice = coverage_gap_notice(
             search_result,
             selected_target_gases,
             range_unit,
             "Achtung: Für diese Zielgase fehlen im Suchbereich Daten in:",
         )
+        cache_note = (
+            " Grundspektrum aus lokalem Ergebniscache; keine erneute HAPI-Absorptionsberechnung."
+            if search_spectrum_cached
+            else ""
+        )
         if not plans:
-            return [], store, "Keine geeigneten Laserfenster gefunden. Bereich vergrößern, weniger Zielgase pro Laser erzwingen oder Schrittweite vergrößern." + coverage_notice
+            return [], store, "Keine geeigneten Laserfenster gefunden. Bereich vergrößern, weniger Zielgase pro Laser erzwingen oder Schrittweite vergrößern." + coverage_notice + cache_note
         if len(visible_plans) < result_limit:
             status = (
                 f"{len(plans)} Vorschläge berechnet. Es wurden nur {len(visible_plans)} ausreichend unterschiedliche Treffer gefunden, obwohl {result_limit} angefordert wurden."
@@ -3530,7 +4393,9 @@ def run_band_search(
             status += (
                 f" Quelle: schnelle Offline-DB ({search_result.temperature_c:.1f} °C, {search_result.pressure_hpa:.2f} hPa, {search_result.step_cm1:.3f} cm⁻¹)."
             )
-        status += coverage_notice
+        if lod_alternatives_added:
+            status += f" Zusätzlich enthalten: bester LoD-Treffer je Zielgas ({lod_alternatives_added})."
+        status += coverage_notice + cache_note
         return [0], store, status
     except Exception as exc:
         return [], None, format_data_source_error(exc, data_source, range_unit, range_min_value, range_max_value)
@@ -3552,15 +4417,49 @@ def sync_search_visible_gases(
 
 
 @app.callback(
+    Output("search-pas-delta-alpha-min", "children"),
+    Input("search-pas-3sigma", "value"),
+    Input("search-pas-popt-eps", "value"),
+)
+def update_search_delta_alpha_min(sigma_3nv: float | None, popt_over_eps: float | None) -> str:
+    delta_alpha_min = compute_pas_delta_alpha_min(sigma_3nv, popt_over_eps, 1.0)
+    return format_pas_delta_alpha(delta_alpha_min)
+
+
+@app.callback(
+    Output("search-results-table", "columns"),
     Output("search-results-table", "data"),
     Input("search-range-unit", "value"),
     Input("search-store", "data"),
+    Input("search-pas-delta-alpha-min", "children"),
 )
-def sync_search_results_table(range_unit: str, store: dict[str, Any] | None) -> list[dict[str, Any]]:
+def sync_search_results_table(
+    range_unit: str,
+    store: dict[str, Any] | None,
+    delta_alpha_min_value: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    columns = [
+        {"name": "Rang", "id": "rank"},
+        {"name": "Laser", "id": "lasers"},
+        {"name": "Abgedeckt", "id": "covered"},
+        {"name": "Fehlt", "id": "missing"},
+        {"name": "Laserfenster", "id": "ranges"},
+    ]
     if not store or not store.get("plans"):
-        return []
+        return columns, []
     plans = [deserialize_laser_plan(plan) for plan in store["plans"]]
-    return search_table_rows(plans, range_unit)
+    target_concentrations = store.get("target_concentrations", {})
+    target_gases = sorted(target_concentrations)
+    columns.extend(
+        {
+            "name": f"LoD {display_formula(gas)} [ppbV]",
+            "id": f"lod_{gas}",
+            "type": "numeric",
+        }
+        for gas in target_gases
+    )
+    delta_alpha_min = sanitize_manual_delta_alpha_min(delta_alpha_min_value, PAS_REFERENCE_DELTA_ALPHA_MIN)
+    return columns, search_table_rows(plans, range_unit, target_concentrations, delta_alpha_min)
 
 
 @app.callback(
@@ -3570,22 +4469,20 @@ def sync_search_results_table(range_unit: str, store: dict[str, Any] | None) -> 
     Output("search-plan-details", "children"),
     Output("search-selected-spectrum-store", "data"),
     Input("search-results-table", "selected_rows"),
+    Input("search-store", "data"),
     Input("search-range-unit", "value"),
     Input("search-log-scale", "value"),
     Input("search-log-level", "value"),
     Input("search-visible-gases", "value"),
-    Input("search-pas-state", "data"),
-    State("search-store", "data"),
     State("search-selected-spectrum-store", "data"),
 )
 def update_search_plot(
     selected_rows: list[int],
+    store: dict[str, Any] | None,
     range_unit: str,
     log_scale: list[str],
     log_level: int,
     visible_gases: list[str] | None,
-    pas_state: dict[str, Any] | None,
-    store: dict[str, Any] | None,
     selected_result_store: dict[str, Any] | None,
 ) -> tuple[go.Figure, html.Div, html.Div, html.Div, dict[str, Any] | None]:
     if not store or not store.get("plans"):
@@ -3600,12 +4497,12 @@ def update_search_plot(
     if row_index >= len(store["plans"]):
         row_index = 0
     plan = deserialize_laser_plan(store["plans"][row_index])
-    cache_key = "|".join([str(row_index), *[window.window_id for window in plan.windows]])
+    cache_key = "|".join([str(store.get("search_revision", "")), str(row_index), *[window.window_id for window in plan.windows]])
     trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
     if trigger_id is None and dash.callback_context.triggered:
         trigger_id = str(dash.callback_context.triggered[0].get("prop_id", "")).split(".", 1)[0]
     can_reuse_cached_result = (
-        trigger_id in {"search-log-scale", "search-log-level", "search-visible-gases", "search-range-unit", "search-pas-state"}
+        trigger_id in {"search-log-scale", "search-log-level", "search-visible-gases", "search-range-unit"}
         and selected_result_store is not None
         and selected_result_store.get("cache_key") == cache_key
         and selected_result_store.get("spectrum") is not None
@@ -3671,7 +4568,6 @@ def update_search_plot(
         revision_key=plan_revision_key,
         preserve_ui_state=False,
         visible_gases=visible_gases,
-        pas_state=pas_state,
     )
     figure.update_layout(meta={**(figure.layout.meta or {}), "step_cm1": fine_step_cm1})
     serialized_result = selected_store_payload["spectrum"]
