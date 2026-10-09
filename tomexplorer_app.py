@@ -165,6 +165,86 @@ def component_visibility_options(serialized_result: dict[str, Any] | None) -> li
     return [{"label": display_formula(gas), "value": gas} for gas in gases]
 
 
+def prepare_cached_manual_payload(
+    payload: dict[str, Any],
+    requested_gases: list[str] | None,
+    range_unit: str,
+    range_min: float,
+    range_max: float,
+) -> tuple[dict[str, Any], list[str]]:
+    prepared = dict(payload)
+    source_components = prepared.get("components", {})
+    if not isinstance(source_components, dict):
+        raise ValueError("Das gespeicherte Spektrum enthält keine Komponenten.")
+
+    requested_gas_set = set(requested_gases or [])
+    selected_gases = [
+        gas for gas in ALL_GASES
+        if gas in source_components and gas in requested_gas_set
+    ]
+    components = {
+        gas: dict(source_components[gas])
+        for gas in selected_gases
+        if isinstance(source_components[gas], dict)
+    }
+    selected_gases = [gas for gas in selected_gases if gas in components]
+    prepared["components"] = components
+    prepared["default_visible_gases"] = selected_gases
+
+    for metadata_key in (
+        "coverage_ranges_cm1_by_gas",
+        "missing_ranges_cm1_by_gas",
+        "source_details_by_gas",
+    ):
+        metadata = prepared.get(metadata_key)
+        if isinstance(metadata, dict):
+            prepared[metadata_key] = {
+                gas: value for gas, value in metadata.items() if gas in components
+            }
+
+    wavenumber = np.asarray(prepared["wavenumber_cm1"], dtype=float)
+    wavelength = np.asarray(prepared["wavelength_um"], dtype=float)
+    source_point_count = wavenumber.size
+    if wavelength.size != source_point_count:
+        raise ValueError("Das gespeicherte Spektrum hat ungültige Achsen.")
+    nu_min, nu_max = normalize_wavenumber_window(range_unit, range_min, range_max)
+    in_requested_range = (wavenumber >= nu_min) & (wavenumber <= nu_max)
+    if not np.any(in_requested_range):
+        raise ValueError("Das gespeicherte Spektrum deckt den angefragten Bereich nicht ab.")
+    crop_to_requested_range = True
+    if crop_to_requested_range:
+        wavenumber = wavenumber[in_requested_range]
+        wavelength = wavelength[in_requested_range]
+        prepared["wavenumber_cm1"] = wavenumber.tolist()
+        prepared["wavelength_um"] = wavelength.tolist()
+        if range_unit == "um":
+            prepared["range_label"] = f"{float(wavelength.min()):.4f}-{float(wavelength.max()):.4f} um"
+        else:
+            prepared["range_label"] = f"{float(wavenumber.min()):.2f}-{float(wavenumber.max()):.2f} cm-1"
+
+    total_sigma = np.zeros(wavenumber.size, dtype=float)
+    total_alpha = np.zeros(wavenumber.size, dtype=float)
+    for gas, component in components.items():
+        for key in ("sigma_cm2_per_molecule", "alpha_per_cm"):
+            values = np.asarray(component.get(key, []), dtype=float)
+            if values.size != source_point_count:
+                raise ValueError(f"Die gespeicherte Komponente {gas} hat eine ungültige Länge.")
+            if crop_to_requested_range:
+                values = values[in_requested_range]
+            component[key] = values.tolist()
+            if key == "sigma_cm2_per_molecule":
+                total_sigma += values
+            else:
+                total_alpha += values
+        if total_alpha.size:
+            peak_index = int(np.argmax(np.asarray(component["alpha_per_cm"], dtype=float)))
+            component["peak_wavenumber_cm1"] = float(wavenumber[peak_index])
+            component["peak_wavelength_um"] = float(wavelength[peak_index])
+    prepared["total_sigma_cm2_per_molecule"] = total_sigma.tolist()
+    prepared["total_alpha_per_cm"] = total_alpha.tolist()
+    return prepared, selected_gases
+
+
 def normalized_visible_gases(options: list[dict[str, str]], selected: list[str] | None) -> list[str]:
     option_values = [entry["value"] for entry in options]
     if not option_values:
@@ -583,11 +663,11 @@ def selected_total_alpha(
     result = deserialize_manual_result(serialized_result)
     visible_set = {
         gas
-        for gas in (visible_gases or list(result.components.keys()))
+        for gas in (
+            list(result.components.keys()) if visible_gases is None else visible_gases
+        )
         if gas in result.components
     }
-    if not visible_set:
-        visible_set = set(result.components.keys())
     total_alpha = np.zeros_like(result.total_alpha_per_cm, dtype=float)
     for gas in visible_set:
         total_alpha += result.components[gas].alpha_per_cm
@@ -2406,6 +2486,15 @@ app.layout = html.Div(
                                                             persistence_type="local",
                                                             className="main-dropdown",
                                                         ),
+                                                        html.Span("Komponenten im Plot", className="field-label"),
+                                                        dcc.Checklist(
+                                                            id="manual-visible-gases",
+                                                            options=[],
+                                                            value=[],
+                                                            persistence=True,
+                                                            persistence_type="local",
+                                                            className="component-visibility-checklist",
+                                                        ),
                                                         html.Div(
                                                             id="manual-concentration-rows",
                                                             className="stack",
@@ -2546,14 +2635,6 @@ app.layout = html.Div(
                                                                             persistence_type="local",
                                                                         ),
                                                                     ],
-                                                                ),
-                                                                dcc.Checklist(
-                                                                    id="manual-visible-gases",
-                                                                    options=[],
-                                                                    value=[],
-                                                                    persistence=True,
-                                                                    persistence_type="local",
-                                                                    className="component-visibility-checklist",
                                                                 ),
                                                             ],
                                                         ),
@@ -3056,10 +3137,14 @@ def suggest_manual_result_snapshot(
         if missing_gases:
             differences.append({"label": "Fehlende Gase", "value": ", ".join(sorted(missing_gases))})
 
-        range_difference = (
+        range_is_contained = (
+            entry_nu_min <= target_nu_min + step_cm1 * 0.05
+            and entry_nu_max >= target_nu_max - step_cm1 * 0.05
+        )
+        range_difference = 0.0 if range_is_contained else (
             abs(entry_nu_min - target_nu_min) + abs(entry_nu_max - target_nu_max)
         ) / target_span
-        if range_difference > 1e-4:
+        if not range_is_contained:
             differences.append({
                 "label": "Bereich (cm⁻¹)",
                 "value": f"{entry_nu_min:.2f}–{entry_nu_max:.2f} statt {target_nu_min:.2f}–{target_nu_max:.2f}",
@@ -3082,12 +3167,8 @@ def suggest_manual_result_snapshot(
             })
 
         entry_step = float(entry.get("step_cm1", 0.0))
-        step_difference = abs(entry_step - step_cm1) / max(abs(step_cm1), 1e-12)
-        if step_difference > 0.05:
-            differences.append({
-                "label": "Schrittweite",
-                "value": f"{entry_step:.4f} statt {step_cm1:.4f} cm⁻¹",
-            })
+        if entry_step > step_cm1 * (1.0 + 1.0e-6):
+            continue
 
         entry_concentrations = {}
         for part in str(entry.get("concentration_signature", "")).split("|"):
@@ -3107,7 +3188,6 @@ def suggest_manual_result_snapshot(
             + range_difference * 100.0
             + temperature_difference * 0.1
             + pressure_difference * 0.01
-            + step_difference
             + (1.0 - overlap_ratio) * 5.0
         )
         candidates.append((score, {
@@ -3164,6 +3244,7 @@ def refresh_manual_cache_options(
     # Wir filtern die Einträge nicht mehr hart auf exakten Match! Wir bewerten stattdessen die Ähnlichkeit.
     # Für jeden Eintrag berechnen wir die Abweichungen und markieren im Label, was abweicht (Temperatur, Druck, Schrittweite, Gase, Bereich).
     # Wir sortieren sie so, dass die ähnlichsten ganz oben stehen.
+    step_target = float(step_cm1 or 1e-3)
     try:
         target_nu_min, target_nu_max = normalize_wavenumber_window(range_unit, float(range_min), float(range_max))
     except Exception:
@@ -3186,17 +3267,10 @@ def refresh_manual_cache_options(
         # 1. Gase checken
         entry_gases = entry.get("gases", [])
         entry_gases_set = set(entry_gases)
-        if entry_gases_set != target_gases_set:
+        missing_in_cache = target_gases_set - entry_gases_set
+        if missing_in_cache:
             is_exact = False
-            # Welche Gase fehlen im Cache oder sind zu viel?
-            missing_in_cache = target_gases_set - entry_gases_set
-            extra_in_cache = entry_gases_set - target_gases_set
-            gas_diffs = []
-            if missing_in_cache:
-                gas_diffs.append(f"fehlend: {','.join(missing_in_cache)}")
-            if extra_in_cache:
-                gas_diffs.append(f"zusätzlich: {','.join(extra_in_cache)}")
-            diff_reasons.append(f"Gase ({'; '.join(gas_diffs)})")
+            diff_reasons.append(f"Gase (fehlend: {','.join(missing_in_cache)})")
 
         # 2. Wellenlängenbereich checken
         entry_nu_min = float(entry.get("nu_min", 0.0))
@@ -3209,8 +3283,14 @@ def refresh_manual_cache_options(
             continue
 
         # Abweichung Bereich
-        nu_diff_pct = (abs(entry_nu_min - target_nu_min) + abs(entry_nu_max - target_nu_max)) / (target_nu_max - target_nu_min + 1e-9)
-        if nu_diff_pct > 1e-4:
+        range_is_contained = (
+            entry_nu_min <= target_nu_min + step_target * 0.05
+            and entry_nu_max >= target_nu_max - step_target * 0.05
+        )
+        nu_diff_pct = 0.0 if range_is_contained else (
+            abs(entry_nu_min - target_nu_min) + abs(entry_nu_max - target_nu_max)
+        ) / (target_nu_max - target_nu_min + 1e-9)
+        if not range_is_contained:
             is_exact = False
             diff_reasons.append("Bereich")
 
@@ -3230,13 +3310,18 @@ def refresh_manual_cache_options(
 
         # 5. Schrittweite checken
         entry_step = float(entry.get("step_cm1", 0.0))
-        step_target = float(step_cm1 or 1e-3)
-        if abs(entry_step - step_target) / step_target > 0.05:
-            is_exact = False
-            diff_reasons.append(f"Schritt={entry_step:.4f} vs {step_target:.4f}")
+        if entry_step > step_target * (1.0 + 1.0e-6):
+            continue
 
         # 6. Konzentrationen checken
-        entry_conc_sig = entry.get("concentration_signature", "")
+        entry_concentrations = {}
+        for part in str(entry.get("concentration_signature", "")).split("|"):
+            if not part:
+                continue
+            gas, raw_value = part.split(":", 1)
+            if gas in target_gases_set:
+                entry_concentrations[gas] = float(raw_value)
+        entry_conc_sig = _manual_concentration_signature(entry_concentrations)
         if entry_conc_sig != target_concentration_sig:
             is_exact = False
             diff_reasons.append("Konzentrationen")
@@ -3246,11 +3331,14 @@ def refresh_manual_cache_options(
         points = int(entry.get("point_count", 0))
 
         # Bestimme verfügbare Komponenten
-        available_components = entry.get("gases", [])
-        comp_str = ", ".join([display_formula(gas_name) for gas_name in ALL_GASES if gas_name in entry_gases_set])
+        comp_str = ", ".join(
+            display_formula(gas_name)
+            for gas_name in ALL_GASES
+            if gas_name in entry_gases_set and gas_name in target_gases_set
+        )
 
         if is_exact:
-            label = f"EXAKT MATCH | {timestamp} | T={entry_t:.1f} °C | p={entry_p:.1f} hPa | {points} Pkt. | Komponenten: {comp_str}"
+            label = f"PASSEND | {timestamp} | T={entry_t:.1f} °C | p={entry_p:.1f} hPa | {points} Pkt. | Komponenten: {comp_str}"
             score = 0 # Höchste Priorität
         else:
             diff_str = ", ".join(diff_reasons)
@@ -3286,12 +3374,18 @@ def refresh_manual_cache_options(
     Input("manual-offline-candidate", "value"),
     State("offline-mode", "value"),
     State("manual-gases", "value"),
+    State("manual-range-unit", "value"),
+    State("manual-range-min", "value"),
+    State("manual-range-max", "value"),
     prevent_initial_call=True,
 )
 def load_manual_cache_candidate(
     snapshot_id: str | None,
     offline_selection: list[str] | None,
     current_gases: list[str] | None,
+    range_unit: str,
+    range_min: float | None,
+    range_max: float | None,
 ) -> tuple[Any, ...]:
     if not snapshot_id:
         raise PreventUpdate
@@ -3300,16 +3394,19 @@ def load_manual_cache_candidate(
         raise PreventUpdate
 
     selected = list(offline_selection or [])
-    payload = dict(payload)
+    payload, selected_gases = prepare_cached_manual_payload(
+        payload,
+        current_gases,
+        range_unit,
+        parse_required_number(range_min, "Minimum"),
+        parse_required_number(range_max, "Maximum"),
+    )
     payload["render_revision"] = int(time.time() * 1000)
     temperature_value = payload.get("temperature_c", dash.no_update)
     pressure_value = payload.get("pressure_hpa", dash.no_update)
     step_value = payload.get("step_cm1", dash.no_update)
 
-    components = payload.get("components", {}) if isinstance(payload.get("components", {}), dict) else {}
-    requested_gases = set(current_gases or [])
-    selected_gases = [gas for gas in ALL_GASES if gas in components and gas in requested_gases]
-    payload["default_visible_gases"] = selected_gases
+    components = payload["components"]
 
     concentration_values: list[float] = []
     concentration_units: list[str] = []
@@ -3833,7 +3930,6 @@ def render_manual_spectrum(
         "manual-y-mode",
         "manual-log-scale",
         "manual-log-level",
-        "manual-visible-gases",
         "manual-range-unit",
     }:
         raise PreventUpdate

@@ -2110,7 +2110,7 @@ def load_matching_manual_result_snapshot(
         if abs(float(entry.get("pressure_hpa", 0.0)) - float(pressure_hpa)) > 1.0e-9:
             continue
         cached_step = float(entry.get("step_cm1", 0.0))
-        if abs(cached_step - requested_step) > max(1.0e-12, requested_step * 1.0e-6):
+        if cached_step > requested_step * (1.0 + 1.0e-6):
             continue
 
         payload = load_manual_result_snapshot(str(entry.get("id", "")))
@@ -2125,11 +2125,11 @@ def load_matching_manual_result_snapshot(
             continue
         if not np.allclose(np.diff(axis), cached_step, rtol=1.0e-3, atol=1.0e-9):
             continue
-        target_nu_min = round(nu_min, 6)
-        target_nu_max = round(nu_max, 6)
-        span_steps = (target_nu_max - target_nu_min) / requested_step
+        target_nu_min = nu_min
+        target_nu_max = nu_max
+        span_steps = (target_nu_max - target_nu_min) / cached_step
         target_point_count = max(2, int(np.floor(span_steps + 1.0e-9)) + 1)
-        target_axis = target_nu_min + np.arange(target_point_count, dtype=float) * requested_step
+        target_axis = target_nu_min + np.arange(target_point_count, dtype=float) * cached_step
         if target_axis.size < 2:
             continue
         if axis[0] > target_axis[0] + cached_step * 1.0e-6:
@@ -2158,28 +2158,22 @@ def load_matching_manual_result_snapshot(
             total_sigma += sigma
             total_alpha += alpha
         else:
-            for gas in sorted(cached_gases - requested_gases):
-                source_component = source_components.get(gas)
-                if not isinstance(source_component, dict):
-                    continue
-                source_sigma = np.asarray(source_component.get("sigma_cm2_per_molecule", []), dtype=float)
-                if source_sigma.size != axis.size:
-                    continue
-                sigma = np.interp(target_axis, axis, source_sigma)
-                cached_concentration = float(source_component.get("concentration", 0.0))
-                component = dict(source_component)
-                component["sigma_cm2_per_molecule"] = sigma.tolist()
-                component["alpha_per_cm"] = (
-                    sigma * total_number_density_cm3(temperature_c, pressure_hpa) * cached_concentration
-                ).tolist()
-                new_components[gas] = component
-
             result = dict(payload)
             target_wavelength = np.asarray(wavenumber_cm1_to_wavelength_um(target_axis), dtype=float)
             result["wavenumber_cm1"] = target_axis.tolist()
             result["wavelength_um"] = target_wavelength.tolist()
             result["components"] = new_components
             result["default_visible_gases"] = sorted(requested_gases)
+            for metadata_key in (
+                "coverage_ranges_cm1_by_gas",
+                "missing_ranges_cm1_by_gas",
+                "source_details_by_gas",
+            ):
+                metadata = result.get(metadata_key)
+                if isinstance(metadata, dict):
+                    result[metadata_key] = {
+                        gas: value for gas, value in metadata.items() if gas in requested_gases
+                    }
             result["total_sigma_cm2_per_molecule"] = total_sigma.tolist()
             result["total_alpha_per_cm"] = total_alpha.tolist()
             result["step_cm1"] = cached_step
