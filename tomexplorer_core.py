@@ -31,7 +31,7 @@ DEFAULT_MAX_PLOT_POINTS = 6000
 # Standardmäßige Linieninformationen links und rechts vom angefragten Wellenzahlbereich (in cm-1)
 FETCH_MARGIN_CM1 = 2.0
 PICKLE_REBUILD_TEMPERATURE_C = 35.0
-PICKLE_REBUILD_PRESSURE_HPA = 1013.25
+PICKLE_REBUILD_PRESSURE_HPA = 1000.0
 LOCAL_CACHE_MAX_GASES = 10
 INTERFERENCE_WORST_CASE_SWEEP_FACTORS = (0.0, 0.5, 1.0)
 TARGET_WORST_CASE_SWEEP_FACTORS = (1.0, 2.0, 5.0)
@@ -1302,8 +1302,10 @@ def _write_offline_sigma_library(
             gas: [[float(start), float(end)] for start, end in _normalize_intervals(ranges)]
             for gas, ranges in coverage_ranges.items()
         }
-    with OFFLINE_SPECTRA_PATH.open("wb") as file_handle:
+    temp_path = OFFLINE_SPECTRA_PATH.with_name(OFFLINE_SPECTRA_PATH.name + ".tmp")
+    with temp_path.open("wb") as file_handle:
         pickle.dump(payload, file_handle, protocol=pickle.HIGHEST_PROTOCOL)
+    temp_path.replace(OFFLINE_SPECTRA_PATH)
     _clear_runtime_caches()
 
 
@@ -1619,6 +1621,160 @@ def _cached_offline_sigma_bundle(
     return target_axis, sigma_map
 
 
+OFFLINE_TIMINGS_PATH = BASE_DIR / "offline_build_timings.json"
+OFFLINE_INCREMENTAL_WING_CM1 = 50.0
+OFFLINE_INCREMENTAL_CHUNK_CM1 = 250.0
+DOWNLOAD_SECONDS_PER_GAS = 30.0
+
+
+def _hitran_nu_parser(header_path: Path):
+    with header_path.open("r", encoding="utf-8") as header_file:
+        positions = json.load(header_file).get("position", {})
+    nu_start = int(positions["nu"])
+    later_positions = sorted(int(value) for value in positions.values() if int(value) > nu_start)
+    nu_end = later_positions[0] if later_positions else None
+    return lambda line: float(line[nu_start:nu_end] if nu_end is not None else line[nu_start:])
+
+
+def _diff_hitran_tables(old_table: str, new_table: str) -> list[float] | None:
+    """Wellenzahlen aller neuen, entfernten oder geaenderten Linien; None wenn kein Vergleich moeglich."""
+    old_data = DATA_DIR / f"{old_table}.data"
+    new_data = DATA_DIR / f"{new_table}.data"
+    if not old_data.exists() or not new_data.exists():
+        return None
+    try:
+        parse_nu = _hitran_nu_parser(DATA_DIR / f"{new_table}.header")
+
+        def read_lines(path: Path) -> set[str]:
+            with path.open("r", encoding="utf-8", errors="ignore") as stream:
+                return {line.rstrip("\r\n") for line in stream if line.strip()}
+
+        old_lines = read_lines(old_data)
+        new_lines = read_lines(new_data)
+        old_nu = [parse_nu(line) for line in old_lines]
+        new_nu = [parse_nu(line) for line in new_lines]
+        if not old_nu or not new_nu:
+            return None
+        overlap_min = max(min(old_nu), min(new_nu))
+        overlap_max = min(max(old_nu), max(new_nu))
+        changed = [parse_nu(line) for line in old_lines ^ new_lines]
+    except Exception:
+        return None
+    return sorted(nu for nu in changed if overlap_min - 1.0e-6 <= nu <= overlap_max + 1.0e-6)
+
+
+def update_offline_pickle_incremental(
+    changed_nu_by_gas: dict[str, list[float]],
+) -> tuple[str, list[str]]:
+    """Rechnet nur die Bereiche um geaenderte Linien neu. Gibt (Meldung, behandelte Gase) zurueck."""
+    if not changed_nu_by_gas or not OFFLINE_SPECTRA_PATH.exists():
+        return "", []
+    metadata = offline_library_metadata()
+    temperature_c = float(metadata["reference_temperature_c"])
+    pressure_hpa = float(metadata["reference_pressure_hpa"])
+    library = dict(_load_offline_sigma_library())
+    coverage_ranges = dict(_load_offline_coverage_ranges())
+
+    handled: list[str] = []
+    summaries: list[str] = []
+    for gas, changed_nu in changed_nu_by_gas.items():
+        if gas not in library:
+            continue
+        handled.append(gas)
+        if not changed_nu:
+            continue
+        axis, old_sigma = library[gas]
+        if axis.size < 2:
+            handled.remove(gas)
+            continue
+        step = float(np.median(np.diff(axis)))
+        sigma = old_sigma.copy()
+        intervals = _clip_intervals(
+            [(nu - OFFLINE_INCREMENTAL_WING_CM1, nu + OFFLINE_INCREMENTAL_WING_CM1) for nu in changed_nu],
+            float(axis[0]),
+            float(axis[-1]),
+        )
+        current_ranges = _coverage_ranges_for_gas_request(
+            gas, temperature_c, pressure_hpa, float(axis[0]), float(axis[-1])
+        )
+        covered_mask = _axis_mask_from_intervals(axis, current_ranges)
+        recomputed_cm1 = 0.0
+        for start, end in intervals:
+            position = start
+            while position < end:
+                chunk_end = min(end, position + OFFLINE_INCREMENTAL_CHUNK_CM1)
+                chunk_mask = (axis >= position) & (axis <= chunk_end)
+                if np.any(chunk_mask & covered_mask):
+                    current_nu, current_sigma = _sigma_from_local_db(
+                        gas, temperature_c, pressure_hpa, position, chunk_end, step
+                    )
+                    update_mask = chunk_mask & covered_mask
+                    sigma[update_mask] = np.interp(axis[update_mask], current_nu, current_sigma)
+                sigma[chunk_mask & ~covered_mask] = 0.0
+                position = chunk_end
+            recomputed_cm1 += end - start
+        library[gas] = (axis, sigma)
+        coverage_ranges[gas] = _normalize_intervals(list(coverage_ranges.get(gas, ())) + list(current_ranges))
+        summaries.append(f"{gas}: {len(changed_nu)} Linien, {recomputed_cm1:.0f} cm-1 neu gerechnet")
+
+    if summaries:
+        _write_offline_sigma_library(
+            library,
+            metadata={
+                "native_step_cm1": float(metadata["native_step_cm1"]),
+                "reference_temperature_c": temperature_c,
+                "reference_pressure_hpa": pressure_hpa,
+            },
+            coverage_ranges=coverage_ranges,
+        )
+    unchanged = [gas for gas in handled if gas not in {item.split(":", 1)[0] for item in summaries}]
+    message = "Offline-PKL inkrementell aktualisiert (" + "; ".join(summaries) + ")." if summaries else ""
+    if unchanged:
+        message += f" Unveraenderte HITRAN-Daten: {', '.join(unchanged)}."
+    return message.strip(), handled
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(float(seconds), 0.0)
+    if seconds < 90.0:
+        return f"{seconds:.0f} s"
+    if seconds < 5400.0:
+        return f"{seconds / 60.0:.0f} min"
+    return f"{seconds / 3600.0:.1f} h"
+
+
+def estimate_hitran_refresh(
+    gases: list[str] | tuple[str, ...],
+    range_unit: str,
+    range_min: float,
+    range_max: float,
+) -> str:
+    selected = sorted({gas for gas in gases if gas in GAS_LIBRARY})
+    nu_min, nu_max = normalize_wavenumber_window(range_unit, range_min, range_max)
+    line_gases = [
+        gas for gas in selected
+        if not _local_xsc_can_build(gas, PICKLE_REBUILD_TEMPERATURE_C, PICKLE_REBUILD_PRESSURE_HPA, nu_min, nu_max)
+    ]
+    timings: dict[str, float] = {}
+    if OFFLINE_TIMINGS_PATH.exists():
+        try:
+            timings = {
+                str(gas): float(value)
+                for gas, value in json.loads(OFFLINE_TIMINGS_PATH.read_text(encoding="utf-8")).get("seconds", {}).items()
+            }
+        except Exception:
+            timings = {}
+    default_seconds = float(np.mean(list(timings.values()))) if timings else 300.0
+    worst_case = sum(timings.get(gas, default_seconds) for gas in line_gases)
+    download = DOWNLOAD_SECONDS_PER_GAS * len(line_gases)
+    return (
+        f"{len(line_gases)} Gas(e) mit Linientabellen werden neu von HITRAN geladen (ca. {format_duration(download)}). "
+        "Anschliessend werden nur die Bereiche um geaenderte oder neue Linien im Offline-Cache neu berechnet; "
+        f"bei kleinen HITRAN-Updates meist nur Minuten, im ungünstigsten Fall (alle Linien geaendert) ca. {format_duration(worst_case)}. "
+        "Waehrend dieser Zeit bitte keine neuen Berechnungen starten."
+    )
+
+
 def refresh_hitran_database(
     gases: list[str] | tuple[str, ...],
     range_unit: str,
@@ -1638,6 +1794,7 @@ def refresh_hitran_database(
     successful_line_gases: list[str] = []
     successful_xsc_gases: list[str] = []
     failed_gases: list[str] = []
+    changed_nu_by_gas: dict[str, list[float] | None] = {}
     for gas in selected_gases:
         if _local_xsc_can_build(
             gas,
@@ -1652,15 +1809,19 @@ def refresh_hitran_database(
         temp_table = f"__tmp__{gas}"
         reset_hitran_tables((temp_table,))
         try:
+            existing_range = _local_table_range(gas)
+            gas_fetch_min = min(fetch_min, existing_range[0]) if existing_range else fetch_min
+            gas_fetch_max = max(fetch_max, existing_range[1]) if existing_range else fetch_max
             hp.fetch(
                 temp_table,
                 gas_config["molecule_id"],
                 gas_config["isotope_id"],
-                fetch_min,
-                fetch_max,
+                gas_fetch_min,
+                gas_fetch_max,
             )
+            changed_nu_by_gas[gas] = _diff_hitran_tables(gas, temp_table)
             replaced_tables.extend(_replace_hitran_table_from_temp(temp_table, gas))
-            _FETCHED_RANGES[gas] = (fetch_min, fetch_max)
+            _FETCHED_RANGES[gas] = (gas_fetch_min, gas_fetch_max)
             successful_line_gases.append(gas)
         except Exception as exc:
             reset_hitran_tables((temp_table,))
@@ -1688,16 +1849,32 @@ def refresh_hitran_database(
 
     _clear_runtime_caches()
     removed_legacy_files = cleanup_unused_files()
-    offline_message = rebuild_offline_pickle_from_hitran(
-        gases=successful_gases,
-        range_unit=range_unit,
-        range_min=range_min,
-        range_max=range_max,
-        step_cm1=DEFAULT_MANUAL_STEP_CM1,
-        temperature_c=PICKLE_REBUILD_TEMPERATURE_C,
-        pressure_hpa=PICKLE_REBUILD_PRESSURE_HPA,
-        merge_with_existing=True,
-    )
+    incremental_candidates = {
+        gas: changed_nu_by_gas[gas]
+        for gas in successful_line_gases
+        if changed_nu_by_gas.get(gas) is not None
+    }
+    offline_messages: list[str] = []
+    handled_incrementally: list[str] = []
+    if incremental_candidates:
+        incremental_message, handled_incrementally = update_offline_pickle_incremental(incremental_candidates)
+        if incremental_message:
+            offline_messages.append(incremental_message)
+    full_rebuild_gases = [gas for gas in successful_gases if gas not in handled_incrementally]
+    if full_rebuild_gases:
+        offline_messages.append(
+            rebuild_offline_pickle_from_hitran(
+                gases=full_rebuild_gases,
+                range_unit=range_unit,
+                range_min=range_min,
+                range_max=range_max,
+                step_cm1=DEFAULT_MANUAL_STEP_CM1,
+                temperature_c=PICKLE_REBUILD_TEMPERATURE_C,
+                pressure_hpa=PICKLE_REBUILD_PRESSURE_HPA,
+                merge_with_existing=True,
+            )
+        )
+    offline_message = " ".join(offline_messages)
 
     cleanup_bits: list[str] = []
     if replaced_tables:
@@ -1764,6 +1941,59 @@ def _cached_sigma_bundle(
     if axis is None:
         axis = np.arange(nu_min, nu_max + (float(step_cm1) * 0.5), float(step_cm1), dtype=float)
     return axis, sigma_map
+
+
+def offline_db_reference(
+    gases: tuple[str, ...] | list[str],
+) -> dict[str, float] | None:
+    """Referenzbedingungen der Offline-DB, wenn sie alle Gase enthält (ohne T/p-Prüfung)."""
+    if not gases or not OFFLINE_SPECTRA_PATH.exists():
+        return None
+    try:
+        metadata = offline_library_metadata()
+        library = _load_offline_sigma_library()
+    except Exception:
+        return None
+    if not all(gas in library for gas in gases):
+        return None
+    return {
+        "temperature_c": float(metadata["reference_temperature_c"]),
+        "pressure_hpa": float(metadata["reference_pressure_hpa"]),
+        "step_cm1": float(metadata["native_step_cm1"]),
+    }
+
+
+def offline_db_native_step(
+    gases: tuple[str, ...] | list[str],
+    temperature_c: float,
+    pressure_hpa: float,
+) -> float | None:
+    """Schrittweite der Offline-DB, wenn T, p und Gase passen (unabhängig von der gewünschten Schrittweite)."""
+    if not gases or not OFFLINE_SPECTRA_PATH.exists():
+        return None
+    try:
+        metadata = offline_library_metadata()
+        library = _load_offline_sigma_library()
+    except Exception:
+        return None
+    if abs(float(metadata["reference_temperature_c"]) - float(temperature_c)) > 0.1:
+        return None
+    if abs(float(metadata["reference_pressure_hpa"]) - float(pressure_hpa)) > 1.0:
+        return None
+    if not all(gas in library for gas in gases):
+        return None
+    return float(metadata["native_step_cm1"])
+
+
+def offline_db_applies(
+    gases: tuple[str, ...] | list[str],
+    temperature_c: float,
+    pressure_hpa: float,
+    step_cm1: float,
+) -> bool:
+    """True, wenn die vorberechnete Offline-DB die Anfrage exakt abdeckt (T, p, Gase; Schrittweite gleich oder feiner)."""
+    native_step = offline_db_native_step(gases, temperature_c, pressure_hpa)
+    return native_step is not None and float(step_cm1) >= native_step * (1.0 - 1.0e-6)
 
 
 def build_manual_spectrum(

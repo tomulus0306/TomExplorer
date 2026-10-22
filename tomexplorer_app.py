@@ -41,8 +41,12 @@ from tomexplorer_core import (
     load_matching_manual_result_snapshot,
     normalize_wavenumber_window,
     offline_library_summary,
+    offline_db_applies,
+    offline_db_reference,
+    offline_db_native_step,
     recommended_step_cm1,
     refresh_hitran_database,
+    estimate_hitran_refresh,
     save_manual_result_snapshot,
     serialize_laser_plan,
     serialize_manual_result,
@@ -329,6 +333,46 @@ def _source_detail_text(gas: str, details: dict[str, Any], range_unit: str) -> s
         return f"{display_formula_plot(gas)}: Offline-DB{extra_text} | Coverage {coverage_text}"
 
     return f"{display_formula_plot(gas)}: keine Quelle im aktuellen Bereich"
+
+
+SOURCE_KIND_LABELS = {
+    "xsc": "XSC",
+    "line_cache": "Liniendaten (HAPI)",
+    "offline_db": "Offline-DB",
+}
+
+
+def simulation_legend(serialized_result: dict[str, Any] | None) -> html.Div:
+    if not serialized_result:
+        return html.Div(className="sim-legend", children=[])
+
+    axis = np.asarray(serialized_result.get("wavenumber_cm1", []), dtype=float)
+    parts: list[str] = []
+    temperature_c = serialized_result.get("temperature_c")
+    pressure_hpa = serialized_result.get("pressure_hpa")
+    if isinstance(temperature_c, (int, float)):
+        parts.append(f"T = {float(temperature_c):.1f} °C")
+    if isinstance(pressure_hpa, (int, float)):
+        parts.append(f"p = {float(pressure_hpa):.1f} hPa")
+    if axis.size > 1:
+        step = float(np.median(np.diff(axis)))
+        parts.append(f"Schrittweite = {step:.4g} cm⁻¹")
+        wavelength_min, wavelength_max = wavenumber_cm1_to_wavelength_um(axis[-1]), wavenumber_cm1_to_wavelength_um(axis[0])
+        parts.append(
+            f"Bereich = {axis[0]:.2f}–{axis[-1]:.2f} cm⁻¹ ({float(wavelength_min):.4f}–{float(wavelength_max):.4f} µm)"
+        )
+        parts.append(f"{axis.size} Punkte")
+    source_kinds = sorted({
+        SOURCE_KIND_LABELS.get(str(details.get("source", "")), "")
+        for details in serialized_result.get("source_details_by_gas", {}).values()
+        if isinstance(details, dict)
+    } - {""})
+    if source_kinds:
+        parts.append("Quelle: " + ", ".join(source_kinds))
+    return html.Div(
+        className="sim-legend",
+        children="Dargestellte Simulation: " + " | ".join(parts) if parts else "",
+    )
 
 
 def source_details_panel(
@@ -2534,9 +2578,9 @@ app.layout = html.Div(
                                                                     dcc.Input(
                                                                         id="manual-pressure",
                                                                         type="number",
-                                                                        value=1035.0,
+                                                                        value=1000.0,
                                                                         className="number-input",
-                                                                        placeholder="1035.0",
+                                                                        placeholder="1000.0",
                                                                         persistence=True,
                                                                         persistence_type="local",
                                                                     ),
@@ -2699,6 +2743,7 @@ app.layout = html.Div(
                                                 ),
                                             ],
                                         ),
+                                        html.Div(id="manual-sim-legend", children=simulation_legend(None)),
                                         html.Div(id="manual-source-info", children=source_details_panel(None, None, "um")),
                                         dcc.Store(id="manual-spectrum-store"),
                                         dcc.Store(id="manual-view-range-store", data=None),
@@ -2708,6 +2753,7 @@ app.layout = html.Div(
                                         dcc.Store(id="manual-cancel-store", data=0),
                                         dcc.Download(id="manual-export-download"),
                                         dcc.ConfirmDialog(id="hitran-update-dialog"),
+                                        dcc.ConfirmDialog(id="hitran-refresh-confirm"),
                                         dcc.Interval(id="startup-hitran-check", interval=400, n_intervals=0, max_intervals=1),
                                     ],
                                 ),
@@ -2803,7 +2849,7 @@ app.layout = html.Div(
                                                                 ),
                                                                 parameter_field(
                                                                     "p [hPa]",
-                                                                    dcc.Input(id="search-pressure", type="number", value=1035.0, className="number-input", placeholder="1035.0"),
+                                                                    dcc.Input(id="search-pressure", type="number", value=1000.0, className="number-input", placeholder="1000.0"),
                                                                 ),
                                                                 parameter_field(
                                                                     "Bereichseinheit",
@@ -3105,6 +3151,10 @@ def estimate_manual_hapi_cost(
     )
 
 
+OFFLINE_SUGGEST_MAX_DT_C = 30.0
+OFFLINE_SUGGEST_MAX_DP_HPA = 300.0
+
+
 def suggest_manual_result_snapshot(
     selected_gases: list[str],
     range_unit: str,
@@ -3167,8 +3217,13 @@ def suggest_manual_result_snapshot(
             })
 
         entry_step = float(entry.get("step_cm1", 0.0))
-        if entry_step > step_cm1 * (1.0 + 1.0e-6):
-            continue
+        step_is_coarser = entry_step > step_cm1 * (1.0 + 1.0e-6)
+        if step_is_coarser:
+            differences.append({
+                "label": "Schrittweite",
+                "value": f"{entry_step:.4g} cm⁻¹ gespeichert (gröber) statt {step_cm1:.4g} cm⁻¹",
+                "highlight": True,
+            })
 
         entry_concentrations = {}
         for part in str(entry.get("concentration_signature", "")).split("|"):
@@ -3453,9 +3508,12 @@ def render_manual_cache_dialog(
     if not dialog_data:
         return {"display": "none"}, "", [], "", "", {"display": "none"}, "Mit HAPI neu berechnen"
 
-    if dialog_data.get("kind") == "similar":
+    if dialog_data.get("kind") in {"similar", "offline"}:
         differences = [
-            html.Li([html.Strong(f"{item['label']}: "), html.Span(item["value"])])
+            html.Li(
+                [html.Strong(f"{item['label']}: "), html.Span(item["value"])],
+                className="is-highlighted" if item.get("highlight") else None,
+            )
             for item in dialog_data.get("differences", [])
         ]
         return (
@@ -3593,6 +3651,7 @@ def cancel_manual_run(n_clicks: int | None, token: int | None) -> int:
     Input("manual-cache-load-store", "data"),
     Input("manual-cache-hapi", "n_clicks"),
     Input("manual-cache-cancel", "n_clicks"),
+    Input("manual-cache-use", "n_clicks"),
     *MANUAL_CONCENTRATION_INPUTS,
     State("manual-spectrum-store", "data"),
     State("manual-cache-dialog-store", "data"),
@@ -3621,6 +3680,7 @@ def update_manual_spectrum(
     _cache_load_token: int,
     _cache_hapi_clicks: int | None,
     _cache_cancel_clicks: int | None,
+    _cache_use_clicks: int | None,
     *concentration_state_values: Any,
 ) -> tuple[dict[str, Any] | None, str, list[str], dict[str, Any] | None]:
     dialog_data = concentration_state_values[-1] if concentration_state_values else None
@@ -3643,6 +3703,12 @@ def update_manual_spectrum(
     if trigger_id == "manual-cache-hapi" and not dialog_data:
         raise PreventUpdate
 
+    use_offline_native = False
+    if trigger_id == "manual-cache-use":
+        if not dialog_data or dialog_data.get("kind") != "offline":
+            raise PreventUpdate
+        use_offline_native = True
+
     MANUAL_CANCEL_EVENT.clear()
     data_source = (
         LIVE_DB_MODE
@@ -3652,7 +3718,7 @@ def update_manual_spectrum(
     auto_update_enabled = "auto" in (auto_update_selection or [])
     if (
         not auto_update_enabled
-        and trigger_id not in {"manual-run", "manual-cache-hapi"}
+        and trigger_id not in {"manual-run", "manual-cache-hapi", "manual-cache-use"}
     ):
         raise PreventUpdate
 
@@ -3688,7 +3754,13 @@ def update_manual_spectrum(
         parsed_pressure = parse_required_number(pressure_hpa, "p [hPa]")
         requested_step = parse_required_number(step_cm1, "Schrittweite [cm⁻¹]")
 
-        if trigger_id != "manual-cache-hapi":
+        if use_offline_native:
+            reference = offline_db_reference(gas_tuple)
+            if reference is None:
+                raise PreventUpdate
+            requested_step = max(requested_step, reference["step_cm1"])
+            data_source = OFFLINE_DB_MODE
+        elif trigger_id != "manual-cache-hapi":
             cached_payload = load_matching_manual_result_snapshot(
                 gases=gas_tuple,
                 range_unit=range_unit,
@@ -3714,41 +3786,85 @@ def update_manual_spectrum(
                     None,
                 )
 
-            cost_summary = estimate_manual_hapi_cost(
-                selected_gases=selected_gases,
-                range_unit=range_unit,
-                range_min=parsed_range_min,
-                range_max=parsed_range_max,
-                step_cm1=requested_step,
-                temperature_c=parsed_temperature,
-                pressure_hpa=parsed_pressure,
-            )
-            suggestion = suggest_manual_result_snapshot(
-                selected_gases=selected_gases,
-                range_unit=range_unit,
-                range_min=parsed_range_min,
-                range_max=parsed_range_max,
-                temperature_c=parsed_temperature,
-                pressure_hpa=parsed_pressure,
-                step_cm1=requested_step,
-                concentrations=concentrations,
-            )
-            if suggestion:
+            if offline_db_applies(gas_tuple, parsed_temperature, parsed_pressure, requested_step):
+                data_source = OFFLINE_DB_MODE
+            else:
+                cost_summary = estimate_manual_hapi_cost(
+                    selected_gases=selected_gases,
+                    range_unit=range_unit,
+                    range_min=parsed_range_min,
+                    range_max=parsed_range_max,
+                    step_cm1=requested_step,
+                    temperature_c=parsed_temperature,
+                    pressure_hpa=parsed_pressure,
+                )
+                suggestion = suggest_manual_result_snapshot(
+                    selected_gases=selected_gases,
+                    range_unit=range_unit,
+                    range_min=parsed_range_min,
+                    range_max=parsed_range_max,
+                    temperature_c=parsed_temperature,
+                    pressure_hpa=parsed_pressure,
+                    step_cm1=requested_step,
+                    concentrations=concentrations,
+                )
+                reference = offline_db_reference(gas_tuple)
+                if (
+                    reference is not None
+                    and abs(reference["temperature_c"] - parsed_temperature) <= OFFLINE_SUGGEST_MAX_DT_C
+                    and abs(reference["pressure_hpa"] - parsed_pressure) <= OFFLINE_SUGGEST_MAX_DP_HPA
+                ):
+                    offline_differences = []
+                    if abs(reference["temperature_c"] - parsed_temperature) > 0.1:
+                        offline_differences.append({
+                            "label": "Temperatur",
+                            "value": f"{reference['temperature_c']:.1f} °C statt {parsed_temperature:.1f} °C",
+                            "highlight": True,
+                        })
+                    if abs(reference["pressure_hpa"] - parsed_pressure) > 1.0:
+                        offline_differences.append({
+                            "label": "Druck",
+                            "value": f"{reference['pressure_hpa']:.1f} hPa statt {parsed_pressure:.1f} hPa",
+                            "highlight": True,
+                        })
+                    if reference["step_cm1"] > requested_step * (1.0 + 1.0e-6):
+                        offline_differences.append({
+                            "label": "Schrittweite",
+                            "value": f"{reference['step_cm1']:.4g} cm⁻¹ (Offline-DB, gröber) statt {requested_step:.4g} cm⁻¹",
+                            "highlight": True,
+                        })
+                    return (
+                        previous_serialized,
+                        "Berechnung wartet auf deine Auswahl.",
+                        list(offline_selection or []),
+                        {
+                            "kind": "offline",
+                            "snapshot_id": "",
+                            "use_offline": True,
+                            "differences": offline_differences,
+                            "summary": (
+                                f"Offline-DB: T={reference['temperature_c']:.1f} °C, p={reference['pressure_hpa']:.1f} hPa, "
+                                f"Schrittweite={reference['step_cm1']:.4g} cm⁻¹, 1000–10000 cm⁻¹."
+                            ),
+                            "cost_summary": cost_summary,
+                        },
+                    )
+                if suggestion:
+                    return (
+                        previous_serialized,
+                        "Berechnung wartet auf deine Auswahl.",
+                        list(offline_selection or []),
+                        {"kind": "similar", **suggestion, "cost_summary": cost_summary},
+                    )
                 return (
                     previous_serialized,
-                    "Berechnung wartet auf deine Auswahl.",
+                    "Keine passende gespeicherte Berechnung gefunden; HAPI wartet auf Bestätigung.",
                     list(offline_selection or []),
-                    {"kind": "similar", **suggestion, "cost_summary": cost_summary},
+                    {"kind": "none", "cost_summary": cost_summary},
                 )
-            return (
-                previous_serialized,
-                "Keine passende gespeicherte Berechnung gefunden; HAPI wartet auf Bestätigung.",
-                list(offline_selection or []),
-                {"kind": "none", "cost_summary": cost_summary},
-            )
 
         spectrum_span = abs(normalize_wavenumber_window(range_unit, parsed_range_min, parsed_range_max)[1] - normalize_wavenumber_window(range_unit, parsed_range_min, parsed_range_max)[0])
-        is_auto_preview = trigger_id not in {"manual-run", "manual-cache-hapi"}
+        is_auto_preview = trigger_id not in {"manual-run", "manual-cache-hapi", "manual-cache-use"}
         effective_step = requested_step
         if is_auto_preview:
             preview_step = max(requested_step, spectrum_span / 3200.0, 0.02)
@@ -3784,20 +3900,20 @@ def update_manual_spectrum(
         serialized["display_range_unit"] = range_unit
         t2 = time.perf_counter()
 
-        cache_serialized = serialize_manual_result(manual_result)
-        save_manual_result_snapshot(
-            serialized_result=cache_serialized,
-            gases=gas_tuple,
-            range_unit=range_unit,
-            range_min=parsed_range_min,
-            range_max=parsed_range_max,
-            temperature_c=manual_result.temperature_c,
-            pressure_hpa=manual_result.pressure_hpa,
-            step_cm1=manual_result.step_cm1,
-            concentrations=concentrations,
-            build_seconds=t1 - t0,
-            download_gases=download_gases,
-        )
+        if data_source != OFFLINE_DB_MODE:
+            save_manual_result_snapshot(
+                serialized_result=serialize_manual_result(manual_result),
+                gases=gas_tuple,
+                range_unit=range_unit,
+                range_min=parsed_range_min,
+                range_max=parsed_range_max,
+                temperature_c=manual_result.temperature_c,
+                pressure_hpa=manual_result.pressure_hpa,
+                step_cm1=manual_result.step_cm1,
+                concentrations=concentrations,
+                build_seconds=t1 - t0,
+                download_gases=download_gases,
+            )
 
         span_cm1 = abs(sampled_result.wavenumber_cm1.max() - sampled_result.wavenumber_cm1.min())
         suggested_step = recommended_step_cm1(span_cm1, manual_mode=True)
@@ -3896,6 +4012,7 @@ def update_manual_view_range(
 @app.callback(
     Output("manual-graph", "figure"),
     Output("manual-source-info", "children"),
+    Output("manual-sim-legend", "children"),
     Input("manual-spectrum-store", "data"),
     Input("manual-y-mode", "value"),
     Input("manual-log-scale", "value"),
@@ -3918,9 +4035,13 @@ def render_manual_spectrum(
     auto_update_selection: list[str] | None,
     current_figure: dict[str, Any] | None,
     current_view_range: dict[str, Any] | None,
-) -> tuple[go.Figure, html.Div]:
+) -> tuple[go.Figure, html.Div, html.Div]:
     if not serialized_result:
-        return empty_figure("Spektrum wird nach der ersten Berechnung hier angezeigt."), source_details_panel(None, None, range_unit)
+        return (
+            empty_figure("Spektrum wird nach der ersten Berechnung hier angezeigt."),
+            source_details_panel(None, None, range_unit),
+            simulation_legend(None),
+        )
 
     trigger_id = getattr(getattr(dash, "ctx", None), "triggered_id", None)
     if trigger_id is None and dash.callback_context.triggered:
@@ -3967,7 +4088,7 @@ def render_manual_spectrum(
         visible_gases=visible_gases,
         pas_state=pas_state if y_mode == "alpha" else None,
     )
-    return figure, source_details_panel(serialized_result, visible_gases, range_unit)
+    return figure, source_details_panel(serialized_result, visible_gases, range_unit), simulation_legend(serialized_result)
 
 
 @app.callback(
@@ -4210,8 +4331,39 @@ def export_manual_spectrum_csv(
 
 
 @app.callback(
-    Output("manual-fetch-status", "children"),
+    Output("hitran-refresh-confirm", "displayed"),
+    Output("hitran-refresh-confirm", "message"),
     Input("manual-fetch", "n_clicks"),
+    State("manual-gases", "value"),
+    State("manual-range-unit", "value"),
+    State("manual-range-min", "value"),
+    State("manual-range-max", "value"),
+    prevent_initial_call=True,
+)
+def confirm_manual_hitran_refresh(
+    n_clicks: int | None,
+    selected_gases: list[str] | None,
+    range_unit: str,
+    range_min: float,
+    range_max: float,
+) -> tuple[bool, str]:
+    if not n_clicks:
+        raise PreventUpdate
+    try:
+        estimate = estimate_hitran_refresh(
+            selected_gases or [],
+            range_unit,
+            parse_required_number(range_min, "Minimum"),
+            parse_required_number(range_max, "Maximum"),
+        )
+    except Exception as exc:
+        estimate = f"Dauer konnte nicht abgeschaetzt werden ({exc})."
+    return True, "HITRAN-Datenbank aktualisieren?\n\n" + estimate + "\n\nDer Offline-Cache wird dabei automatisch aktualisiert."
+
+
+@app.callback(
+    Output("manual-fetch-status", "children"),
+    Input("hitran-refresh-confirm", "submit_n_clicks"),
     State("manual-gases", "value"),
     State("manual-range-unit", "value"),
     State("manual-range-min", "value"),
@@ -4222,15 +4374,16 @@ def export_manual_spectrum_csv(
         (Output("manual-run-fetch-lock", "style"), BUTTON_LOCK_VISIBLE, BUTTON_LOCK_HIDDEN),
         (Output("search-run-fetch-lock", "style"), BUTTON_LOCK_VISIBLE, BUTTON_LOCK_HIDDEN),
     ],
+    prevent_initial_call=True,
 )
 def refresh_manual_hitran_cache(
-    n_clicks: int | None,
+    submit_n_clicks: int | None,
     selected_gases: list[str],
     range_unit: str,
     range_min: float,
     range_max: float,
 ) -> str:
-    if not n_clicks:
+    if not submit_n_clicks:
         return ""
 
     try:
@@ -4249,11 +4402,28 @@ def refresh_manual_hitran_cache(
     Output("hitran-update-dialog", "displayed"),
     Output("hitran-update-dialog", "message"),
     Input("startup-hitran-check", "n_intervals"),
+    State("manual-gases", "value"),
+    State("manual-range-unit", "value"),
+    State("manual-range-min", "value"),
+    State("manual-range-max", "value"),
 )
-def show_hitran_update_dialog(_n_intervals: int) -> tuple[bool, str]:
+def show_hitran_update_dialog(
+    _n_intervals: int,
+    selected_gases: list[str] | None,
+    range_unit: str,
+    range_min: float,
+    range_max: float,
+) -> tuple[bool, str]:
     message = startup_hitran_message()
     if not message:
         return False, ""
+    try:
+        gases = selected_gases or cached_hitran_gases()
+        message += "\n\n" + estimate_hitran_refresh(
+            gases, range_unit, parse_required_number(range_min, "Minimum"), parse_required_number(range_max, "Maximum")
+        )
+    except Exception:
+        pass
     return True, message
 
 

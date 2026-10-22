@@ -14,3 +14,10 @@ __tmp_root.html
 Spektren.ipynb
 
 .vscode/
+# Offline-DB-Build-Artefakte
+offline_build/
+offline_build*.log
+offline_build*.err
+abscross_dict_backup_*.pkl
+app.log
+app.err

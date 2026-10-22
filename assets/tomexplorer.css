@@ -776,6 +776,20 @@ body {
   border: 1px solid rgba(226, 232, 240, 0.95);
 }
 
+.sim-legend {
+  margin-top: 6px;
+  color: #64748b;
+  font-size: 0.78rem;
+  line-height: 1.3;
+}
+
+.cache-dialog-differences li.is-highlighted {
+  background: #fef3c7;
+  border-left: 4px solid #f59e0b;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
 .source-info-list {
   display: grid;
   gap: 4px;
